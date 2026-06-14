@@ -1,3 +1,4 @@
+import { SessionModel } from '../database/models/session.model.js';
 import sessionManager from '../services/session.manager.js';
 import logger from '../utils/logger.js';
 
@@ -35,25 +36,29 @@ class ReconnectJob {
   }
 
   /**
-   * Run reconnect check
+   * Run reconnect check — only for sessions that were previously logged in
    */
   async run() {
     const sessions = sessionManager.getAllSessions();
     const disconnected = sessions.filter((s) => s.status === 'disconnected');
 
     for (const session of disconnected) {
-      if (session.reconnectAttempts < 10) {
-        try {
-          logger.info('Reconnect job attempting reconnect', {
-            sessionId: session.sessionId,
-          });
-          await sessionManager.reconnectSession(session.sessionId);
-        } catch (error) {
-          logger.error('Reconnect job failed', {
-            sessionId: session.sessionId,
-            error: error.message,
-          });
-        }
+      if (session.reconnectAttempts >= 10) continue;
+
+      try {
+        const dbSession = await SessionModel.findBySessionId(session.sessionId);
+        // Skip sessions that never completed login (still waiting for QR)
+        if (!dbSession?.phone) continue;
+
+        logger.info('Reconnect job attempting reconnect', {
+          sessionId: session.sessionId,
+        });
+        await sessionManager.reconnectSession(session.sessionId);
+      } catch (error) {
+        logger.error('Reconnect job failed', {
+          sessionId: session.sessionId,
+          error: error.message,
+        });
       }
     }
   }

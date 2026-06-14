@@ -6,6 +6,8 @@ import makeWASocket, {
   Browsers,
   DisconnectReason,
   downloadMediaMessage,
+  fetchLatestBaileysVersion,
+  fetchLatestWaWebVersion,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
@@ -16,7 +18,7 @@ import env from '../config/env.js';
 import { AuthModel } from '../database/models/auth.model.js';
 import { MessageLogModel } from '../database/models/messageLog.model.js';
 import { SessionModel } from '../database/models/session.model.js';
-import { fromJid, isFromMe, parseMessageContent, toJid } from '../utils/helpers.js';
+import { fromJid, isFromMe, parseMessageContent, sleep, toJid } from '../utils/helpers.js';
 import logger from '../utils/logger.js';
 import { AppError } from '../utils/errors.js';
 
@@ -24,6 +26,11 @@ import webhookService from './webhook.service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSIONS_DIR = path.join(__dirname, '../storage/sessions');
+
+/** @type {[number, number, number] | null} */
+let cachedWaVersion = null;
+let versionFetchedAt = 0;
+const VERSION_TTL_MS = 60 * 60 * 1000;
 
 /** @typedef {'disconnected' | 'connecting' | 'qr' | 'pairing' | 'connected' | 'destroyed'} SessionStatus */
 
@@ -51,6 +58,8 @@ class SessionManager {
     this.io = null;
     /** @type {Set<string>} */
     this.reconnectQueue = new Set();
+    /** @type {Map<string, Promise<SessionInstance>>} */
+    this.connectionLocks = new Map();
     this.isRestoring = false;
   }
 
@@ -60,6 +69,34 @@ class SessionManager {
    */
   init(io) {
     this.io = io;
+  }
+
+  /**
+   * Fetch latest WhatsApp Web version (cached for 1 hour)
+   * @param {boolean} [force]
+   * @returns {Promise<[number, number, number]>}
+   */
+  async getWaVersion(force = false) {
+    const now = Date.now();
+    if (!force && cachedWaVersion && now - versionFetchedAt < VERSION_TTL_MS) {
+      return cachedWaVersion;
+    }
+
+    try {
+      const { version, isLatest } = await fetchLatestWaWebVersion({});
+      cachedWaVersion = version;
+      versionFetchedAt = now;
+      logger.info('WhatsApp Web version resolved', { version, isLatest });
+      return version;
+    } catch (error) {
+      logger.warn('fetchLatestWaWebVersion failed, falling back to Baileys version', {
+        error: error.message,
+      });
+      const { version } = await fetchLatestBaileysVersion();
+      cachedWaVersion = version;
+      versionFetchedAt = now;
+      return version;
+    }
   }
 
   /**
@@ -152,6 +189,51 @@ class SessionManager {
   }
 
   /**
+   * Cancel pending reconnect for a session
+   * @param {string} sessionId
+   */
+  cancelReconnect(sessionId) {
+    const instance = this.getOrCreateInstance(sessionId);
+    if (instance.reconnectTimer) {
+      clearTimeout(instance.reconnectTimer);
+      instance.reconnectTimer = null;
+    }
+    this.reconnectQueue.delete(sessionId);
+  }
+
+  /**
+   * Check if session has auth files on disk
+   * @param {string} sessionId
+   * @returns {boolean}
+   */
+  hasAuthFiles(sessionId) {
+    const authDir = this.getSessionPath(sessionId);
+    if (!fs.existsSync(authDir)) return false;
+    return fs.readdirSync(authDir).length > 0;
+  }
+
+  /**
+   * Wait until QR is generated or timeout
+   * @param {string} sessionId
+   * @param {number} timeoutMs
+   * @returns {Promise<string | null>}
+   */
+  async waitForQR(sessionId, timeoutMs = 60000) {
+    const instance = this.getOrCreateInstance(sessionId);
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      if (instance.qr) return instance.qr;
+      if (instance.status === 'connected') {
+        throw new AppError('Session already connected. QR is not required.', 400);
+      }
+      await sleep(500);
+    }
+
+    return instance.qr || null;
+  }
+
+  /**
    * Get or create session instance metadata
    * @param {string} sessionId
    * @returns {SessionInstance}
@@ -199,14 +281,41 @@ class SessionManager {
   }
 
   /**
-   * Connect or reconnect a session
+   * Connect or reconnect a session (with lock to prevent parallel connects)
    * @param {string} sessionId
    * @param {object} [options]
    * @returns {Promise<SessionInstance>}
    */
-  async connectSession(sessionId, _options = {}) {
+  async connectSession(sessionId, options = {}) {
+    const existingLock = this.connectionLocks.get(sessionId);
+    if (existingLock) return existingLock;
+
+    const connectPromise = this._connectSession(sessionId, options);
+    this.connectionLocks.set(sessionId, connectPromise);
+
+    try {
+      return await connectPromise;
+    } finally {
+      if (this.connectionLocks.get(sessionId) === connectPromise) {
+        this.connectionLocks.delete(sessionId);
+      }
+    }
+  }
+
+  /**
+   * Internal connect implementation
+   * @param {string} sessionId
+   * @param {object} [options]
+   * @returns {Promise<SessionInstance>}
+   */
+  async _connectSession(sessionId, options = {}) {
     const instance = this.getOrCreateInstance(sessionId);
     instance.isDestroying = false;
+    this.cancelReconnect(sessionId);
+
+    if (options.freshAuth) {
+      await this.clearSessionAuth(sessionId);
+    }
 
     if (instance.socket) {
       try {
@@ -227,9 +336,11 @@ class SessionManager {
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
     instance.saveCreds = saveCreds;
 
+    const version = await this.getWaVersion(options.freshAuth);
     const baileysLogger = pino({ level: 'silent' });
 
     const socket = makeWASocket({
+      version,
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
@@ -239,7 +350,10 @@ class SessionManager {
       syncFullHistory: false,
       markOnlineOnConnect: false,
       generateHighQualityLinkPreview: true,
+      connectTimeoutMs: 60000,
+      qrTimeout: 60000,
       logger: baileysLogger,
+      getMessage: async () => undefined,
     });
 
     instance.socket = socket;
@@ -308,17 +422,47 @@ class SessionManager {
 
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const isRegistered = socket.authState?.creds?.registered === true;
+        const isConnectionFailure = [405, 403, 500, DisconnectReason.badSession].includes(
+          statusCode,
+        );
+
+        if (instance.isDestroying) {
+          await this.updateSessionStatus(sessionId, 'destroyed');
+          return;
+        }
+
+        // Unregistered session (QR / pairing login) — clear bad auth, do not auto-reconnect
+        if (!isRegistered) {
+          instance.qr = null;
+          this.cancelReconnect(sessionId);
+
+          if (isConnectionFailure || statusCode === DisconnectReason.loggedOut) {
+            logger.warn('Clearing auth after failed login attempt', { sessionId, statusCode });
+            await this.clearSessionAuth(sessionId);
+            if (statusCode === 405) {
+              cachedWaVersion = null;
+              versionFetchedAt = 0;
+            }
+          }
+
+          await this.updateSessionStatus(sessionId, 'disconnected');
+          this.emit('session.disconnected', {
+            sessionId,
+            status: 'disconnected',
+            reason: statusCode,
+          });
+
+          logger.warn('Session disconnected during login', { sessionId, statusCode });
+          return;
+        }
+
         const shouldReconnect =
           !instance.isDestroying &&
           statusCode !== DisconnectReason.loggedOut &&
           statusCode !== 401;
 
         instance.qr = null;
-
-        if (instance.isDestroying) {
-          await this.updateSessionStatus(sessionId, 'destroyed');
-          return;
-        }
 
         await this.updateSessionStatus(sessionId, 'disconnected');
         this.emit('session.disconnected', {
@@ -529,16 +673,29 @@ class SessionManager {
    * @returns {Promise<string | null>}
    */
   async getQR(sessionId) {
-    let instance = this.sessions.get(sessionId);
+    const instance = this.getOrCreateInstance(sessionId);
 
-    if (!instance?.socket) {
-      await this.connectSession(sessionId);
-      instance = this.sessions.get(sessionId);
-
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+    if (instance.status === 'connected') {
+      throw new AppError('Session already connected. QR is not required.', 400);
     }
 
-    return instance?.qr || null;
+    if (instance.qr) return instance.qr;
+
+    this.cancelReconnect(sessionId);
+
+    if (!instance.socket || instance.status === 'disconnected') {
+      await this.connectSession(sessionId, { freshAuth: true });
+    }
+
+    let qr = await this.waitForQR(sessionId, 45000);
+
+    if (!qr) {
+      logger.info('QR not received, retrying with fresh auth', { sessionId });
+      await this.connectSession(sessionId, { freshAuth: true });
+      qr = await this.waitForQR(sessionId, 45000);
+    }
+
+    return qr;
   }
 
   /**

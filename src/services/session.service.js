@@ -93,7 +93,10 @@ class SessionService {
 
     const qr = await sessionManager.getQR(sessionId);
     if (!qr) {
-      throw new AppError('QR code not available yet. Please wait and try again.', 202);
+      throw new AppError(
+        'QR code could not be generated. Delete the session, create again, and retry.',
+        503,
+      );
     }
 
     return { sessionId, qr };
