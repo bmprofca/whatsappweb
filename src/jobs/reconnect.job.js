@@ -44,6 +44,7 @@ class ReconnectJob {
 
     for (const session of disconnected) {
       if (session.reconnectAttempts >= 10) continue;
+      if (session.status === 'conflict') continue;
 
       try {
         const dbSession = await SessionModel.findBySessionId(session.sessionId);

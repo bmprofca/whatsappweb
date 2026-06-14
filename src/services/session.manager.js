@@ -35,7 +35,7 @@ let cachedWaVersion = null;
 let versionFetchedAt = 0;
 const VERSION_TTL_MS = 60 * 60 * 1000;
 
-/** @typedef {'disconnected' | 'connecting' | 'qr' | 'pairing' | 'connected' | 'destroyed'} SessionStatus */
+/** @typedef {'disconnected' | 'connecting' | 'qr' | 'pairing' | 'connected' | 'conflict' | 'destroyed'} SessionStatus */
 
 /**
  * @typedef {object} SessionInstance
@@ -301,11 +301,11 @@ class SessionManager {
     instance.authBackupTimer = setTimeout(async () => {
       instance.authBackupTimer = null;
       await this.backupAuthToDb(sessionId);
-    }, 1500);
+    }, 500);
   }
 
   /**
-   * Ensure local auth exists and is not older than database backup
+   * Ensure local auth files exist; restore from DB only on cold start
    * @param {string} sessionId
    * @returns {Promise<boolean>}
    */
@@ -313,33 +313,38 @@ class SessionManager {
     this.ensureSessionDir(sessionId);
     const authDir = this.getSessionPath(sessionId);
     const localCredsPath = path.join(authDir, 'creds.json');
-    const hasLocalCreds = fs.existsSync(localCredsPath);
-    const dbAuth = await AuthModel.findMetaBySessionId(sessionId);
 
-    if (!dbAuth?.auth_data) {
-      return hasLocalCreds;
+    if (fs.existsSync(localCredsPath)) {
+      return true;
     }
 
-    if (!hasLocalCreds) {
+    const restored = await this.restoreAuthFromDb(sessionId);
+    if (restored) {
       logger.info('Restoring auth from database', { sessionId });
-      return this.restoreAuthFromDb(sessionId);
     }
+    return restored;
+  }
 
-    const localMtime = fs.statSync(localCredsPath).mtimeMs;
-    const dbMtime = new Date(dbAuth.updated_at).getTime();
-
-    if (dbMtime > localMtime + 1000) {
-      logger.info('Database auth is newer than local files, restoring from database', {
-        sessionId,
-      });
-      return this.restoreAuthFromDb(sessionId);
+  /**
+   * Claim exclusive session ownership for this server
+   * @param {string} sessionId
+   */
+  async acquireSessionLock(sessionId) {
+    const acquired = await SessionModel.tryAcquireLock(sessionId, env.serverId);
+    if (!acquired) {
+      throw new AppError(
+        'Session is active on another server. Stop the other instance before connecting.',
+        409,
+      );
     }
+  }
 
-    if (localMtime > dbMtime + 1000) {
-      await this.backupAuthToDb(sessionId);
-    }
-
-    return true;
+  /**
+   * Release session ownership for this server
+   * @param {string} sessionId
+   */
+  async releaseSessionLock(sessionId) {
+    await SessionModel.releaseLock(sessionId, env.serverId);
   }
 
   /**
@@ -508,6 +513,7 @@ class SessionManager {
     await this.updateSessionStatus(sessionId, 'connecting');
     this.emit('session.connecting', { sessionId, status: 'connecting' });
 
+    await this.acquireSessionLock(sessionId);
     await this.ensureAuthState(sessionId);
 
     const authPath = this.getSessionPath(sessionId);
@@ -638,10 +644,19 @@ class SessionManager {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
 
         if (statusCode === DisconnectReason.connectionReplaced) {
-          logger.warn(
-            'Session replaced by another WhatsApp connection. Run only one server instance per session.',
+          this.cancelReconnect(sessionId);
+          await this.releaseSessionLock(sessionId);
+          await this.updateSessionStatus(sessionId, 'conflict');
+          this.emit('session.conflict', {
+            sessionId,
+            status: 'conflict',
+            reason: statusCode,
+          });
+          logger.error(
+            'Session replaced by another WhatsApp connection (440). Stop all other servers using this session, then re-pair with a fresh QR scan.',
             { sessionId },
           );
+          return;
         }
 
         if (instance.isDestroying) {
@@ -703,6 +718,7 @@ class SessionManager {
         const shouldReconnect =
           !instance.isDestroying &&
           statusCode !== DisconnectReason.loggedOut &&
+          statusCode !== DisconnectReason.connectionReplaced &&
           statusCode !== 401;
 
         this.deleteQrImage(sessionId);
@@ -1098,6 +1114,7 @@ class SessionManager {
     }
 
     await this.clearSessionAuth(sessionId);
+    await this.releaseSessionLock(sessionId);
     this.deleteQrImage(sessionId);
     await SessionModel.delete(sessionId);
     this.sessions.delete(sessionId);
@@ -1142,6 +1159,13 @@ class SessionManager {
             });
           }
         } catch (error) {
+          await this.releaseSessionLock(session.session_id).catch(() => {});
+          if (error.statusCode === 409) {
+            logger.warn('Skipping session restore — owned by another server', {
+              sessionId: session.session_id,
+            });
+            continue;
+          }
           logger.error('Failed to restore session', {
             sessionId: session.session_id,
             error: error.message,
@@ -1178,6 +1202,7 @@ class SessionManager {
       connected: all.filter((s) => s.status === 'connected').length,
       connecting: all.filter((s) => s.status === 'connecting').length,
       disconnected: all.filter((s) => s.status === 'disconnected').length,
+      conflict: all.filter((s) => s.status === 'conflict').length,
       qr: all.filter((s) => s.status === 'qr').length,
       pairing: all.filter((s) => s.status === 'pairing').length,
       reconnectQueue: this.reconnectQueue.size,
@@ -1212,6 +1237,7 @@ class SessionManager {
 
     this.sessions.clear();
     this.reconnectQueue.clear();
+    await SessionModel.releaseAllLocksForServer(env.serverId);
   }
 }
 

@@ -88,4 +88,49 @@ export const SessionModel = {
   async delete(sessionId) {
     await execute('DELETE FROM whatsapp_sessions WHERE session_id = ?', [sessionId]);
   },
+
+  /**
+   * Claim session ownership for this server instance
+   * @param {string} sessionId
+   * @param {string} serverId
+   * @returns {Promise<boolean>}
+   */
+  async tryAcquireLock(sessionId, serverId) {
+    const result = await execute(
+      `UPDATE whatsapp_sessions
+       SET active_server = ?, updated_at = NOW()
+       WHERE session_id = ?
+         AND (
+           active_server IS NULL
+           OR active_server = ?
+           OR updated_at < DATE_SUB(NOW(), INTERVAL 2 MINUTE)
+         )`,
+      [serverId, sessionId, serverId],
+    );
+    return result.affectedRows > 0;
+  },
+
+  /**
+   * Release session ownership
+   * @param {string} sessionId
+   * @param {string} serverId
+   * @returns {Promise<void>}
+   */
+  async releaseLock(sessionId, serverId) {
+    await execute(
+      'UPDATE whatsapp_sessions SET active_server = NULL WHERE session_id = ? AND active_server = ?',
+      [sessionId, serverId],
+    );
+  },
+
+  /**
+   * Release all locks held by a server instance
+   * @param {string} serverId
+   * @returns {Promise<void>}
+   */
+  async releaseAllLocksForServer(serverId) {
+    await execute('UPDATE whatsapp_sessions SET active_server = NULL WHERE active_server = ?', [
+      serverId,
+    ]);
+  },
 };
