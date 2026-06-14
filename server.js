@@ -36,6 +36,7 @@ async function start() {
       logger.info(`Server running on ${env.baseUrl}`, {
         port: env.port,
         env: env.nodeEnv,
+        mode: env.isProduction ? 'production' : 'development',
       });
 
       await sessionManager.restoreSessions();

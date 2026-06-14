@@ -36,6 +36,10 @@ app.use(limiter);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+app.get('/', (req, res) => {
+  return success(res, 'Server is working');
+});
+
 app.get('/health', (req, res) => {
   const stats = sessionService.getStats();
   return success(res, 'Server is healthy', {

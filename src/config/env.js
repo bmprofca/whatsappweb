@@ -2,12 +2,16 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+const nodeEnv = process.env.NODE_ENV || 'development';
+const isProduction = nodeEnv === 'production';
+
 const env = {
   port: parseInt(process.env.PORT || '3000', 10),
-  nodeEnv: process.env.NODE_ENV || 'development',
+  nodeEnv,
+  isProduction,
+  isDevelopment: !isProduction,
   baseUrl: process.env.BASE_URL || 'http://localhost:3000',
   apiKey: process.env.API_KEY || '',
-  jwtSecret: process.env.JWT_SECRET || 'change-me',
   db: {
     host: process.env.DB_HOST || 'localhost',
     port: parseInt(process.env.DB_PORT || '3306', 10),
@@ -29,5 +33,34 @@ const env = {
   },
   corsOrigin: process.env.CORS_ORIGIN || '*',
 };
+
+/**
+ * Validate required production environment variables
+ */
+function validateProductionEnv() {
+  if (!isProduction) return;
+
+  const missing = [];
+
+  if (!env.apiKey || env.apiKey === 'your_api_key_here') {
+    missing.push('API_KEY');
+  }
+
+  if (!env.baseUrl || env.baseUrl.includes('localhost')) {
+    missing.push('BASE_URL (must be your live domain)');
+  }
+
+  if (!env.db.host || !env.db.user || !env.db.database) {
+    missing.push('DB_HOST, DB_USER, DB_NAME');
+  }
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Production environment misconfigured. Set these in .env: ${missing.join(', ')}`,
+    );
+  }
+}
+
+validateProductionEnv();
 
 export default env;

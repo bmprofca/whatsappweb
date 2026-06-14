@@ -11,7 +11,7 @@ Production-ready Node.js WhatsApp API server supporting multiple concurrent What
 - **Webhooks** — Per-session webhook URLs with 3-retry delivery
 - **Socket.IO** — Real-time events for frontend dashboards
 - **Message APIs** — Send text, image, document, audio, video, location
-- **Production ready** — PM2, graceful shutdown, health checks, rate limiting
+- **Production ready** — Git deploy, graceful shutdown, health checks, rate limiting
 
 ## Tech Stack
 
@@ -22,7 +22,6 @@ Production-ready Node.js WhatsApp API server supporting multiple concurrent What
 - Socket.IO
 - Winston Logger
 - Joi Validation
-- PM2 compatible
 
 ## Quick Start
 
@@ -30,50 +29,100 @@ Production-ready Node.js WhatsApp API server supporting multiple concurrent What
 
 - Node.js 20+
 - MySQL 8.0+
-- PM2 (optional, for production)
 
-### Installation
+### Local Development
 
 ```bash
-# Clone and install
+git clone https://github.com/bmprofca/whatsappweb.git
+cd whatsappweb
 npm install
 
-# Configure environment
 cp .env.example .env
-# Edit .env with your database credentials and API key
+# Set NODE_ENV=development and your DB credentials in .env
 
-# Run database migrations
-npm run migrate
-
-# Start server
 npm start
 ```
 
-### Development
+For auto-reload during development:
 
 ```bash
 npm run dev
 ```
 
-### Production (PM2)
+### Production Deployment (Git)
+
+On your live server, pull from git and run with `NODE_ENV=production`.
 
 ```bash
-npm run pm2:start
+git clone https://github.com/bmprofca/whatsappweb.git
+cd whatsappweb
+npm install --production
+
+cp .env.example .env
+```
+
+Edit `.env` on the **live server** (this file is not in git):
+
+```env
+NODE_ENV=production
+PORT=3000
+BASE_URL=https://whatsappweb.onesaasbackend.com
+
+DB_HOST=your_db_host
+DB_PORT=3306
+DB_USER=your_db_user
+DB_PASSWORD=your_db_password
+DB_NAME=your_db_name
+
+API_KEY=your_strong_api_key
+CORS_ORIGIN=https://your-frontend-domain.com
+```
+
+Start the server:
+
+```bash
+npm start
+```
+
+Database tables are created automatically on first start.
+
+### Environment: Local vs Production
+
+| Setting | Local (your machine) | Live server |
+|---------|----------------------|-------------|
+| `NODE_ENV` | `development` | `production` |
+| `BASE_URL` | `http://localhost:5677` | `https://whatsappweb.onesaasbackend.com` |
+| Console logs | Enabled | Disabled (file logs only) |
+| API_KEY | Optional | **Required** |
+| Migrations | Auto on startup | Auto on startup |
+
+**Local `.env` example:**
+
+```env
+NODE_ENV=development
+PORT=5677
+BASE_URL=http://localhost:5677
+```
+
+**Production `.env` example:**
+
+```env
+NODE_ENV=production
+BASE_URL=https://whatsappweb.onesaasbackend.com
 ```
 
 ## Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PORT` | Server port | `3000` |
-| `DB_HOST` | MySQL host | `localhost` |
+| `NODE_ENV` | Runtime mode (`development` or `production`) | `development` |
+| `PORT` | Server port | `5677` (local), `3000` (production) |
 | `DB_PORT` | MySQL port | `3306` |
 | `DB_USER` | MySQL user | `root` |
 | `DB_PASSWORD` | MySQL password | — |
 | `DB_NAME` | Database name | `whatsapp_server` |
 | `API_KEY` | API authentication key | — |
-| `JWT_SECRET` | JWT secret (reserved) | — |
-| `BASE_URL` | Server base URL | `http://localhost:3000` |
+| `BASE_URL` | Server base URL | `http://localhost:5677` |
 | `CORS_ORIGIN` | CORS allowed origins | `*` |
 
 ## Authentication
@@ -81,7 +130,7 @@ npm run pm2:start
 All `/api/*` endpoints require the `X-API-Key` header:
 
 ```bash
-curl -H "X-API-Key: your_api_key_here" http://localhost:3000/api/sessions
+curl -H "X-API-Key: your_api_key_here" http://localhost:5677/api/sessions
 ```
 
 ## API Overview
@@ -119,7 +168,7 @@ See [docs/API.md](docs/API.md) for full API documentation.
 
 ## Socket.IO Events
 
-Connect to `ws://localhost:3000` and listen for real-time events.
+Connect to `ws://localhost:5677` (local) or `wss://whatsappweb.onesaasbackend.com` (production) for real-time events.
 
 | Event | Description |
 |-------|-------------|
@@ -136,9 +185,9 @@ See [docs/SOCKET.IO.md](docs/SOCKET.IO.md) for full Socket.IO documentation.
 ## Project Structure
 
 ```
+server.js                   # Entry point
 src/
 ├── app.js                  # Express app setup
-├── server.js               # HTTP server + graceful shutdown
 ├── config/                 # Environment, database, logger
 ├── routes/                 # API route definitions
 ├── controllers/            # Request handlers

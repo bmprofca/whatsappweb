@@ -1,6 +1,7 @@
 # API Documentation
 
-Base URL: `http://localhost:3000`
+Base URL (local): `http://localhost:5677`  
+Base URL (production): `https://whatsappweb.onesaasbackend.com`
 
 All `/api/*` endpoints require the `X-API-Key` header unless `API_KEY` is not set in environment.
 
@@ -430,19 +431,19 @@ When events occur, the server POSTs to the session's webhook URL:
 
 ```bash
 # 1. Create session
-curl -X POST http://localhost:3000/api/sessions/create \
+curl -X POST http://localhost:5677/api/sessions/create \
   -H "X-API-Key: your_api_key" \
   -H "Content-Type: application/json" \
   -d '{"sessionId": "session1", "webhookUrl": "https://your-server.com/hook"}'
 
 # 2. Get QR code (or use Socket.IO qr.updated event)
-curl http://localhost:3000/api/sessions/session1/qr \
+curl http://localhost:5677/api/sessions/session1/qr \
   -H "X-API-Key: your_api_key"
 
 # 3. After scanning QR, session connects automatically
 
 # 4. Send a message
-curl -X POST http://localhost:3000/api/messages/send-text \
+curl -X POST http://localhost:5677/api/messages/send-text \
   -H "X-API-Key: your_api_key" \
   -H "Content-Type: application/json" \
   -d '{"sessionId": "session1", "number": "919999999999", "message": "Hello!"}'
@@ -452,13 +453,13 @@ curl -X POST http://localhost:3000/api/messages/send-text \
 
 ```bash
 # 1. Create session
-curl -X POST http://localhost:3000/api/sessions/create \
+curl -X POST http://localhost:5677/api/sessions/create \
   -H "X-API-Key: your_api_key" \
   -H "Content-Type: application/json" \
   -d '{"sessionId": "session2", "pairingCodeEnabled": true}'
 
 # 2. Request pairing code
-curl -X POST http://localhost:3000/api/sessions/session2/pairing-code \
+curl -X POST http://localhost:5677/api/sessions/session2/pairing-code \
   -H "X-API-Key: your_api_key" \
   -H "Content-Type: application/json" \
   -d '{"phone": "919999999999"}'

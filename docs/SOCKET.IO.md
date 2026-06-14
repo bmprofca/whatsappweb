@@ -7,7 +7,7 @@ Connect to the server via Socket.IO for real-time WhatsApp session and message u
 ```javascript
 import { io } from 'socket.io-client';
 
-const socket = io('http://localhost:3000', {
+const socket = io('http://localhost:5677', {
   transports: ['websocket', 'polling'],
 });
 ```
@@ -24,7 +24,7 @@ function WhatsAppDashboard() {
   const [messages, setMessages] = useState([]);
 
   useEffect(() => {
-    const socket = io('http://localhost:3000');
+    const socket = io('http://localhost:5677');
 
     socket.on('connect', () => {
       console.log('Connected to server');
@@ -291,7 +291,7 @@ socket.on('message.received', (data) => {
 ## Connection Lifecycle Example
 
 ```javascript
-const socket = io('http://localhost:3000');
+const socket = io('http://localhost:5677');
 const SESSION_ID = 'session1';
 
 socket.on('connect', () => {
