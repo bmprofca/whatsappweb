@@ -1,6 +1,5 @@
 import cors from 'cors';
 import express from 'express';
-import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 
 import env from './config/env.js';
@@ -24,15 +23,6 @@ app.use(
   }),
 );
 
-const limiter = rateLimit({
-  windowMs: env.rateLimit.windowMs,
-  max: env.rateLimit.max,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { success: false, message: 'Too many requests, please try again later' },
-});
-
-app.use(limiter);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 

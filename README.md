@@ -11,7 +11,7 @@ Production-ready Node.js WhatsApp API server supporting multiple concurrent What
 - **Webhooks** — Per-session webhook URLs with 3-retry delivery
 - **Socket.IO** — Real-time events for frontend dashboards
 - **Message APIs** — Send text, image, document, audio, video, location
-- **Production ready** — Git deploy, graceful shutdown, health checks, rate limiting
+- **Production ready** — Git deploy, graceful shutdown, health checks
 
 ## Tech Stack
 

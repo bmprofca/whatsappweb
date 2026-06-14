@@ -27,10 +27,6 @@ const env = {
     delayMs: parseInt(process.env.RECONNECT_DELAY_MS || '5000', 10),
     maxAttempts: parseInt(process.env.MAX_RECONNECT_ATTEMPTS || '10', 10),
   },
-  rateLimit: {
-    windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000', 10),
-    max: parseInt(process.env.RATE_LIMIT_MAX || '100', 10),
-  },
   corsOrigin: process.env.CORS_ORIGIN || '*',
 };
 
