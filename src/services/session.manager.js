@@ -2,12 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import NodeCache from '@cacheable/node-cache';
+
 import makeWASocket, {
   Browsers,
   DisconnectReason,
   downloadMediaMessage,
   fetchLatestBaileysVersion,
-  fetchLatestWaWebVersion,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
@@ -16,10 +17,10 @@ import QRCode from 'qrcode';
 
 import env from '../config/env.js';
 import { AuthModel } from '../database/models/auth.model.js';
-import { MessageLogModel } from '../database/models/messageLog.model.js';
 import { SessionModel } from '../database/models/session.model.js';
 import { fromJid, isFromMe, parseMessageContent, sleep, toJid } from '../utils/helpers.js';
 import { MessageStore } from '../utils/message-store.js';
+import { wrapKeyStoreWithBackup } from '../utils/auth-store.js';
 import logger from '../utils/logger.js';
 import { AppError } from '../utils/errors.js';
 
@@ -50,6 +51,7 @@ const VERSION_TTL_MS = 60 * 60 * 1000;
  * @property {NodeJS.Timeout | null} reconnectTimer
  * @property {Function | null} saveCreds
  * @property {MessageStore} messageStore
+ * @property {NodeJS.Timeout | null} authBackupTimer
  */
 
 /**
@@ -77,7 +79,8 @@ class SessionManager {
   }
 
   /**
-   * Fetch latest WhatsApp Web version (cached for 1 hour)
+   * Resolve WhatsApp Web version from Baileys (cached for 1 hour).
+   * Avoid fetchLatestWaWebVersion — it can cause encryption incompatibilities.
    * @param {boolean} [force]
    * @returns {Promise<[number, number, number]>}
    */
@@ -87,21 +90,46 @@ class SessionManager {
       return cachedWaVersion;
     }
 
+    const { version } = await fetchLatestBaileysVersion();
+    cachedWaVersion = version;
+    versionFetchedAt = now;
+    logger.info('WhatsApp Web version resolved', { version, source: 'baileys' });
+    return version;
+  }
+
+  /**
+   * Resolve recipient JID via WhatsApp before sending
+   * @param {import('@whiskeysockets/baileys').WASocket} socket
+   * @param {string} number
+   * @returns {Promise<string>}
+   */
+  async resolveRecipientJid(socket, number) {
+    const jid = toJid(number);
+
     try {
-      const { version, isLatest } = await fetchLatestWaWebVersion({});
-      cachedWaVersion = version;
-      versionFetchedAt = now;
-      logger.info('WhatsApp Web version resolved', { version, isLatest });
-      return version;
+      const results = await socket.onWhatsApp(jid);
+      const match = results?.find((entry) => entry.exists && entry.jid);
+      if (match?.jid) return match.jid;
     } catch (error) {
-      logger.warn('fetchLatestWaWebVersion failed, falling back to Baileys version', {
+      logger.warn('Failed to resolve WhatsApp JID, using phone JID', {
+        number,
         error: error.message,
       });
-      const { version } = await fetchLatestBaileysVersion();
-      cachedWaVersion = version;
-      versionFetchedAt = now;
-      return version;
     }
+
+    return jid;
+  }
+
+  /**
+   * Resolve JID and sync encryption pre-keys before sending
+   * @param {import('@whiskeysockets/baileys').WASocket} socket
+   * @param {string} number
+   * @returns {Promise<string>}
+   */
+  async prepareForSend(socket, number) {
+    const jid = await this.resolveRecipientJid(socket, number);
+    await socket.uploadPreKeysToServerIfRequired();
+    return jid;
   }
 
   /**
@@ -261,6 +289,60 @@ class SessionManager {
   }
 
   /**
+   * Debounce auth backup after signal key updates
+   * @param {string} sessionId
+   */
+  scheduleAuthBackup(sessionId) {
+    const instance = this.getOrCreateInstance(sessionId);
+    if (instance.authBackupTimer) {
+      clearTimeout(instance.authBackupTimer);
+    }
+
+    instance.authBackupTimer = setTimeout(async () => {
+      instance.authBackupTimer = null;
+      await this.backupAuthToDb(sessionId);
+    }, 1500);
+  }
+
+  /**
+   * Ensure local auth exists and is not older than database backup
+   * @param {string} sessionId
+   * @returns {Promise<boolean>}
+   */
+  async ensureAuthState(sessionId) {
+    this.ensureSessionDir(sessionId);
+    const authDir = this.getSessionPath(sessionId);
+    const localCredsPath = path.join(authDir, 'creds.json');
+    const hasLocalCreds = fs.existsSync(localCredsPath);
+    const dbAuth = await AuthModel.findMetaBySessionId(sessionId);
+
+    if (!dbAuth?.auth_data) {
+      return hasLocalCreds;
+    }
+
+    if (!hasLocalCreds) {
+      logger.info('Restoring auth from database', { sessionId });
+      return this.restoreAuthFromDb(sessionId);
+    }
+
+    const localMtime = fs.statSync(localCredsPath).mtimeMs;
+    const dbMtime = new Date(dbAuth.updated_at).getTime();
+
+    if (dbMtime > localMtime + 1000) {
+      logger.info('Database auth is newer than local files, restoring from database', {
+        sessionId,
+      });
+      return this.restoreAuthFromDb(sessionId);
+    }
+
+    if (localMtime > dbMtime + 1000) {
+      await this.backupAuthToDb(sessionId);
+    }
+
+    return true;
+  }
+
+  /**
    * Cancel pending reconnect for a session
    * @param {string} sessionId
    */
@@ -332,6 +414,7 @@ class SessionManager {
         reconnectTimer: null,
         saveCreds: null,
         messageStore: new MessageStore(),
+        authBackupTimer: null,
       });
     }
     return this.sessions.get(sessionId);
@@ -425,12 +508,21 @@ class SessionManager {
     await this.updateSessionStatus(sessionId, 'connecting');
     this.emit('session.connecting', { sessionId, status: 'connecting' });
 
+    await this.ensureAuthState(sessionId);
+
     const authPath = this.getSessionPath(sessionId);
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
     instance.saveCreds = saveCreds;
 
     const version = await this.getWaVersion(options.freshAuth);
     const baileysLogger = pino({ level: 'silent' });
+    const keysWithBackup = wrapKeyStoreWithBackup(state.keys, () =>
+      this.scheduleAuthBackup(sessionId),
+    );
+    const msgRetryCounterCache = new NodeCache({
+      stdTTL: 3600,
+      useClones: false,
+    });
 
     /** @type {import('@whiskeysockets/baileys').WASocket | null} */
     let socketRef = null;
@@ -439,22 +531,20 @@ class SessionManager {
       version,
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
+        keys: makeCacheableSignalKeyStore(keysWithBackup, baileysLogger),
       },
       printQRInTerminal: false,
-      browser: Browsers.ubuntu('WhatsApp API Server'),
+      browser: Browsers.macOS('Chrome'),
       syncFullHistory: false,
       emitOwnEvents: true,
       markOnlineOnConnect: false,
-      generateHighQualityLinkPreview: true,
+      generateHighQualityLinkPreview: false,
       connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 30000,
       qrTimeout: 60000,
       logger: baileysLogger,
-      getMessage: async (key) => {
-        const stored = instance.messageStore.get(key);
-        if (stored) return stored;
-        return { conversation: '' };
-      },
+      msgRetryCounterCache,
+      getMessage: async (key) => instance.messageStore.get(key),
       patchMessageBeforeSending: async (msg) => {
         if (socketRef) {
           await socketRef.uploadPreKeysToServerIfRequired();
@@ -523,6 +613,17 @@ class SessionManager {
 
         logger.info('Session connected', { sessionId, phone });
 
+        try {
+          await socket.uploadPreKeysToServerIfRequired();
+          await saveCreds();
+          await this.backupAuthToDb(sessionId);
+        } catch (error) {
+          logger.warn('Post-connect auth sync failed', {
+            sessionId,
+            error: error.message,
+          });
+        }
+
         const dbSession = await SessionModel.findBySessionId(sessionId);
         if (dbSession?.webhook_url) {
           await webhookService.send(dbSession.webhook_url, 'session.connected', {
@@ -535,6 +636,13 @@ class SessionManager {
 
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
+
+        if (statusCode === DisconnectReason.connectionReplaced) {
+          logger.warn(
+            'Session replaced by another WhatsApp connection. Run only one server instance per session.',
+            { sessionId },
+          );
+        }
 
         if (instance.isDestroying) {
           await this.updateSessionStatus(sessionId, 'destroyed');
@@ -659,16 +767,6 @@ class SessionManager {
 
       const messageId = msg.key.id;
 
-      await MessageLogModel.create({
-        sessionId,
-        messageId,
-        direction,
-        sender,
-        receiver,
-        messageType,
-        messageText,
-      });
-
       let mediaUrl = null;
       if (['image', 'video', 'audio', 'document', 'sticker'].includes(messageType)) {
         try {
@@ -702,8 +800,6 @@ class SessionManager {
 
       const eventName = fromMe ? 'message.sent' : 'message.received';
       this.emit(eventName, payload);
-
-      logger.info('Message processed', { sessionId, messageId, direction, messageType });
 
       const dbSession = await SessionModel.findBySessionId(sessionId);
       if (dbSession?.webhook_url) {
@@ -843,7 +939,7 @@ class SessionManager {
   async sendText(sessionId, number, message) {
     const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
-    const jid = toJid(number);
+    const jid = await this.prepareForSend(socket, number);
     const result = await socket.sendMessage(jid, { text: message });
     this.storeSentMessage(instance, result);
     return result;
@@ -859,7 +955,7 @@ class SessionManager {
   async sendImage(sessionId, number, { url, caption }) {
     const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
-    const jid = toJid(number);
+    const jid = await this.prepareForSend(socket, number);
     const result = await socket.sendMessage(jid, { image: { url }, caption: caption || '' });
     this.storeSentMessage(instance, result);
     return result;
@@ -875,7 +971,7 @@ class SessionManager {
   async sendDocument(sessionId, number, { url, fileName, mimetype, caption }) {
     const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
-    const jid = toJid(number);
+    const jid = await this.prepareForSend(socket, number);
     const result = await socket.sendMessage(jid, {
       document: { url },
       fileName: fileName || 'document',
@@ -896,7 +992,7 @@ class SessionManager {
   async sendAudio(sessionId, number, { url, ptt, mimetype }) {
     const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
-    const jid = toJid(number);
+    const jid = await this.prepareForSend(socket, number);
     const result = await socket.sendMessage(jid, {
       audio: { url },
       mimetype: mimetype || 'audio/mpeg',
@@ -916,7 +1012,7 @@ class SessionManager {
   async sendVideo(sessionId, number, { url, caption }) {
     const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
-    const jid = toJid(number);
+    const jid = await this.prepareForSend(socket, number);
     const result = await socket.sendMessage(jid, { video: { url }, caption: caption || '' });
     this.storeSentMessage(instance, result);
     return result;
@@ -932,7 +1028,7 @@ class SessionManager {
   async sendLocation(sessionId, number, { latitude, longitude, name, address }) {
     const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
-    const jid = toJid(number);
+    const jid = await this.prepareForSend(socket, number);
     const result = await socket.sendMessage(jid, {
       location: {
         degreesLatitude: latitude,
@@ -1035,9 +1131,7 @@ class SessionManager {
 
       for (const session of sessions) {
         try {
-          const hasAuth =
-            fs.existsSync(this.getSessionPath(session.session_id)) ||
-            (await this.restoreAuthFromDb(session.session_id));
+          const hasAuth = await this.ensureAuthState(session.session_id);
 
           if (hasAuth) {
             await this.connectSession(session.session_id);
@@ -1102,6 +1196,7 @@ class SessionManager {
       const instance = this.sessions.get(sessionId);
       if (instance) {
         instance.isDestroying = true;
+        if (instance.authBackupTimer) clearTimeout(instance.authBackupTimer);
         if (instance.reconnectTimer) clearTimeout(instance.reconnectTimer);
         if (instance.socket) {
           try {

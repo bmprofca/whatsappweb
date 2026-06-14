@@ -42,6 +42,17 @@ export const AuthModel = {
   },
 
   /**
+   * Get auth data and last update time for session
+   * @param {string} sessionId
+   * @returns {Promise<{ auth_data: string, updated_at: string } | null>}
+   */
+  async findMetaBySessionId(sessionId) {
+    return queryOne('SELECT auth_data, updated_at FROM whatsapp_auth WHERE session_id = ?', [
+      sessionId,
+    ]);
+  },
+
+  /**
    * Delete auth data
    * @param {string} sessionId
    * @returns {Promise<void>}
