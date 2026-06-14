@@ -19,6 +19,7 @@ import { AuthModel } from '../database/models/auth.model.js';
 import { MessageLogModel } from '../database/models/messageLog.model.js';
 import { SessionModel } from '../database/models/session.model.js';
 import { fromJid, isFromMe, parseMessageContent, sleep, toJid } from '../utils/helpers.js';
+import { MessageStore } from '../utils/message-store.js';
 import logger from '../utils/logger.js';
 import { AppError } from '../utils/errors.js';
 
@@ -48,6 +49,7 @@ const VERSION_TTL_MS = 60 * 60 * 1000;
  * @property {boolean} isDestroying
  * @property {NodeJS.Timeout | null} reconnectTimer
  * @property {Function | null} saveCreds
+ * @property {MessageStore} messageStore
  */
 
 /**
@@ -329,9 +331,21 @@ class SessionManager {
         isDestroying: false,
         reconnectTimer: null,
         saveCreds: null,
+        messageStore: new MessageStore(),
       });
     }
     return this.sessions.get(sessionId);
+  }
+
+  /**
+   * Store sent message for Baileys encryption retry handling
+   * @param {SessionInstance} instance
+   * @param {object} result
+   */
+  storeSentMessage(instance, result) {
+    if (result?.key && result?.message) {
+      instance.messageStore.save(result);
+    }
   }
 
   /**
@@ -418,6 +432,9 @@ class SessionManager {
     const version = await this.getWaVersion(options.freshAuth);
     const baileysLogger = pino({ level: 'silent' });
 
+    /** @type {import('@whiskeysockets/baileys').WASocket | null} */
+    let socketRef = null;
+
     const socket = makeWASocket({
       version,
       auth: {
@@ -427,14 +444,26 @@ class SessionManager {
       printQRInTerminal: false,
       browser: Browsers.ubuntu('WhatsApp API Server'),
       syncFullHistory: false,
+      emitOwnEvents: true,
       markOnlineOnConnect: false,
       generateHighQualityLinkPreview: true,
       connectTimeoutMs: 60000,
       qrTimeout: 60000,
       logger: baileysLogger,
-      getMessage: async () => undefined,
+      getMessage: async (key) => {
+        const stored = instance.messageStore.get(key);
+        if (stored) return stored;
+        return { conversation: '' };
+      },
+      patchMessageBeforeSending: async (msg) => {
+        if (socketRef) {
+          await socketRef.uploadPreKeysToServerIfRequired();
+        }
+        return msg;
+      },
     });
 
+    socketRef = socket;
     instance.socket = socket;
     this.setupEventHandlers(sessionId, socket, saveCreds);
 
@@ -597,6 +626,10 @@ class SessionManager {
     });
 
     socket.ev.on('messages.upsert', async ({ messages, type }) => {
+      for (const msg of messages) {
+        instance.messageStore.save(msg);
+      }
+
       if (type !== 'notify') return;
 
       for (const msg of messages) {
@@ -808,9 +841,11 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendText(sessionId, number, message) {
+    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
     const jid = toJid(number);
     const result = await socket.sendMessage(jid, { text: message });
+    this.storeSentMessage(instance, result);
     return result;
   }
 
@@ -822,9 +857,12 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendImage(sessionId, number, { url, caption }) {
+    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
     const jid = toJid(number);
-    return socket.sendMessage(jid, { image: { url }, caption: caption || '' });
+    const result = await socket.sendMessage(jid, { image: { url }, caption: caption || '' });
+    this.storeSentMessage(instance, result);
+    return result;
   }
 
   /**
@@ -835,14 +873,17 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendDocument(sessionId, number, { url, fileName, mimetype, caption }) {
+    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
     const jid = toJid(number);
-    return socket.sendMessage(jid, {
+    const result = await socket.sendMessage(jid, {
       document: { url },
       fileName: fileName || 'document',
       mimetype: mimetype || 'application/pdf',
       caption: caption || '',
     });
+    this.storeSentMessage(instance, result);
+    return result;
   }
 
   /**
@@ -853,13 +894,16 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendAudio(sessionId, number, { url, ptt, mimetype }) {
+    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
     const jid = toJid(number);
-    return socket.sendMessage(jid, {
+    const result = await socket.sendMessage(jid, {
       audio: { url },
       mimetype: mimetype || 'audio/mpeg',
       ptt: ptt || false,
     });
+    this.storeSentMessage(instance, result);
+    return result;
   }
 
   /**
@@ -870,9 +914,12 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendVideo(sessionId, number, { url, caption }) {
+    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
     const jid = toJid(number);
-    return socket.sendMessage(jid, { video: { url }, caption: caption || '' });
+    const result = await socket.sendMessage(jid, { video: { url }, caption: caption || '' });
+    this.storeSentMessage(instance, result);
+    return result;
   }
 
   /**
@@ -883,9 +930,10 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendLocation(sessionId, number, { latitude, longitude, name, address }) {
+    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
     const jid = toJid(number);
-    return socket.sendMessage(jid, {
+    const result = await socket.sendMessage(jid, {
       location: {
         degreesLatitude: latitude,
         degreesLongitude: longitude,
@@ -893,6 +941,8 @@ class SessionManager {
         address: address || '',
       },
     });
+    this.storeSentMessage(instance, result);
+    return result;
   }
 
   /**
