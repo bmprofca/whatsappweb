@@ -1,0 +1,12 @@
+node_modules/
+.env
+logs/
+src/storage/sessions/*
+!src/storage/sessions/.gitkeep
+.DS_Store
+*.log
+coverage/
+.idea/
+.vscode/
+dist/
+.pm2/
