@@ -3,6 +3,8 @@ node_modules/
 logs/
 src/storage/sessions/*
 !src/storage/sessions/.gitkeep
+src/storage/qr/*
+!src/storage/qr/.gitkeep
 .DS_Store
 *.log
 coverage/

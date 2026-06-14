@@ -56,8 +56,8 @@ router.get('/:id', validate(sessionIdParamSchema, 'params'), asyncHandler(getSes
  * Headers: X-API-Key
  * Params: id — sessionId (alphanumeric, 3-100 chars)
  * Body: none
- * Response 200: { success, message, data: { sessionId, qr } }  // qr is base64 data URL
- * Response 503: QR could not be generated — delete session and create again
+ * Response 200: { success, message, data: { sessionId, imageName, imageUrl } }
+ * Example imageUrl: https://whatsappweb.onesaasbackend.com/qr/session1.png
  */
 router.get('/:id/qr', validate(sessionIdParamSchema, 'params'), asyncHandler(getQR));
 

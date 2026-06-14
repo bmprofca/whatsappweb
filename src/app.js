@@ -1,6 +1,8 @@
 import cors from 'cors';
 import express from 'express';
 import helmet from 'helmet';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 import env from './config/env.js';
 import apiKeyAuth from './middlewares/auth.js';
@@ -12,9 +14,16 @@ import sessionService from './services/session.service.js';
 import { formatUptime, getMemoryUsage } from './utils/helpers.js';
 import { success } from './utils/response.js';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const qrImagesDir = path.join(__dirname, 'storage/qr');
+
 const app = express();
 
-app.use(helmet());
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  }),
+);
 app.use(
   cors({
     origin: env.corsOrigin === '*' ? '*' : env.corsOrigin.split(','),
@@ -25,6 +34,8 @@ app.use(
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+app.use('/qr', express.static(qrImagesDir));
 
 app.get('/', (req, res) => {
   return success(res, 'Server is working');

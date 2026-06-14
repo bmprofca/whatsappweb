@@ -26,6 +26,7 @@ import webhookService from './webhook.service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSIONS_DIR = path.join(__dirname, '../storage/sessions');
+const QR_DIR = path.join(__dirname, '../storage/qr');
 
 /** @type {[number, number, number] | null} */
 let cachedWaVersion = null;
@@ -40,6 +41,8 @@ const VERSION_TTL_MS = 60 * 60 * 1000;
  * @property {import('@whiskeysockets/baileys').WASocket | null} socket
  * @property {SessionStatus} status
  * @property {string | null} qr
+ * @property {string | null} qrImageName
+ * @property {string | null} qrImageUrl
  * @property {string | null} pairingCode
  * @property {number} reconnectAttempts
  * @property {boolean} isDestroying
@@ -116,6 +119,73 @@ class SessionManager {
     const dir = this.getSessionPath(sessionId);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
+    }
+  }
+
+  /**
+   * Ensure QR images directory exists
+   */
+  ensureQrDir() {
+    if (!fs.existsSync(QR_DIR)) {
+      fs.mkdirSync(QR_DIR, { recursive: true });
+    }
+  }
+
+  /**
+   * Get QR image file path for session
+   * @param {string} sessionId
+   * @returns {string}
+   */
+  getQrImagePath(sessionId) {
+    return path.join(QR_DIR, `${sessionId}.png`);
+  }
+
+  /**
+   * Get public QR image URL for session
+   * @param {string} sessionId
+   * @returns {string}
+   */
+  getQrImageUrl(sessionId) {
+    return `${env.baseUrl}/qr/${sessionId}.png`;
+  }
+
+  /**
+   * Save QR code as PNG file
+   * @param {string} sessionId
+   * @param {string} qrString
+   * @returns {Promise<{ imageName: string, imageUrl: string }>}
+   */
+  async saveQrImage(sessionId, qrString) {
+    this.ensureQrDir();
+    const imageName = `${sessionId}.png`;
+    const filePath = this.getQrImagePath(sessionId);
+    const imageUrl = this.getQrImageUrl(sessionId);
+
+    await QRCode.toFile(filePath, qrString, { width: 300, margin: 2 });
+
+    const instance = this.getOrCreateInstance(sessionId);
+    instance.qrImageName = imageName;
+    instance.qrImageUrl = imageUrl;
+    instance.qr = imageUrl;
+
+    return { imageName, imageUrl };
+  }
+
+  /**
+   * Delete QR image file for session
+   * @param {string} sessionId
+   */
+  deleteQrImage(sessionId) {
+    const filePath = this.getQrImagePath(sessionId);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+
+    const instance = this.sessions.get(sessionId);
+    if (instance) {
+      instance.qr = null;
+      instance.qrImageName = null;
+      instance.qrImageUrl = null;
     }
   }
 
@@ -223,14 +293,21 @@ class SessionManager {
     const deadline = Date.now() + timeoutMs;
 
     while (Date.now() < deadline) {
-      if (instance.qr) return instance.qr;
+      if (instance.qrImageUrl) {
+        return {
+          imageName: instance.qrImageName,
+          imageUrl: instance.qrImageUrl,
+        };
+      }
       if (instance.status === 'connected') {
         throw new AppError('Session already connected. QR is not required.', 400);
       }
       await sleep(500);
     }
 
-    return instance.qr || null;
+    return instance.qrImageUrl
+      ? { imageName: instance.qrImageName, imageUrl: instance.qrImageUrl }
+      : null;
   }
 
   /**
@@ -245,6 +322,8 @@ class SessionManager {
         socket: null,
         status: 'disconnected',
         qr: null,
+        qrImageName: null,
+        qrImageUrl: null,
         pairingCode: null,
         reconnectAttempts: 0,
         isDestroying: false,
@@ -377,22 +456,27 @@ class SessionManager {
     });
 
     socket.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      const { connection, lastDisconnect, qr, isNewLogin } = update;
+
+      if (isNewLogin) {
+        logger.info('Pairing successful, saving credentials', { sessionId });
+        await saveCreds();
+        await this.backupAuthToDb(sessionId);
+      }
 
       if (qr) {
         try {
-          const qrDataUrl = await QRCode.toDataURL(qr);
-          instance.qr = qrDataUrl;
+          const { imageName, imageUrl } = await this.saveQrImage(sessionId, qr);
           await this.updateSessionStatus(sessionId, 'qr');
-          this.emit('qr.updated', { sessionId, qr: qrDataUrl });
-          logger.info('QR code generated', { sessionId });
+          this.emit('qr.updated', { sessionId, imageName, imageUrl });
+          logger.info('QR code generated', { sessionId, imageUrl });
         } catch (error) {
           logger.error('QR generation failed', { sessionId, error: error.message });
         }
       }
 
       if (connection === 'open') {
-        instance.qr = null;
+        this.deleteQrImage(sessionId);
         instance.pairingCode = null;
         instance.reconnectAttempts = 0;
         this.reconnectQueue.delete(sessionId);
@@ -422,19 +506,41 @@ class SessionManager {
 
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const isRegistered = socket.authState?.creds?.registered === true;
-        const isConnectionFailure = [405, 403, 500, DisconnectReason.badSession].includes(
-          statusCode,
-        );
 
         if (instance.isDestroying) {
           await this.updateSessionStatus(sessionId, 'destroyed');
           return;
         }
 
-        // Unregistered session (QR / pairing login) — clear bad auth, do not auto-reconnect
+        // After QR scan, WhatsApp sends 515 — must reconnect to finish login
+        if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+          logger.info('Restart required after scan, reconnecting to complete login', {
+            sessionId,
+            statusCode,
+          });
+          try {
+            await saveCreds();
+            await this.backupAuthToDb(sessionId);
+          } catch (error) {
+            logger.error('Failed to save creds before restart', {
+              sessionId,
+              error: error.message,
+            });
+          }
+          await this.updateSessionStatus(sessionId, 'connecting');
+          this.emit('session.connecting', { sessionId, status: 'connecting' });
+          setTimeout(() => this.reconnectSession(sessionId), 1500);
+          return;
+        }
+
+        const isRegistered = socket.authState?.creds?.registered === true;
+        const isConnectionFailure = [405, 403, 500, DisconnectReason.badSession].includes(
+          statusCode,
+        );
+
+        // Unregistered session — real failure during QR / pairing login
         if (!isRegistered) {
-          instance.qr = null;
+          this.deleteQrImage(sessionId);
           this.cancelReconnect(sessionId);
 
           if (isConnectionFailure || statusCode === DisconnectReason.loggedOut) {
@@ -462,7 +568,7 @@ class SessionManager {
           statusCode !== DisconnectReason.loggedOut &&
           statusCode !== 401;
 
-        instance.qr = null;
+        this.deleteQrImage(sessionId);
 
         await this.updateSessionStatus(sessionId, 'disconnected');
         this.emit('session.disconnected', {
@@ -479,12 +585,6 @@ class SessionManager {
             sessionId,
             reason: statusCode,
           });
-        }
-
-        if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
-          logger.info('Restart required, reconnecting', { sessionId });
-          setTimeout(() => this.reconnectSession(sessionId), 2000);
-          return;
         }
 
         if (shouldReconnect) {
@@ -670,7 +770,7 @@ class SessionManager {
   /**
    * Get QR code for session
    * @param {string} sessionId
-   * @returns {Promise<string | null>}
+   * @returns {Promise<{ imageName: string, imageUrl: string } | null>}
    */
   async getQR(sessionId) {
     const instance = this.getOrCreateInstance(sessionId);
@@ -679,7 +779,9 @@ class SessionManager {
       throw new AppError('Session already connected. QR is not required.', 400);
     }
 
-    if (instance.qr) return instance.qr;
+    if (instance.qrImageUrl && fs.existsSync(this.getQrImagePath(sessionId))) {
+      return { imageName: instance.qrImageName, imageUrl: instance.qrImageUrl };
+    }
 
     this.cancelReconnect(sessionId);
 
@@ -687,15 +789,15 @@ class SessionManager {
       await this.connectSession(sessionId, { freshAuth: true });
     }
 
-    let qr = await this.waitForQR(sessionId, 45000);
+    let qrData = await this.waitForQR(sessionId, 45000);
 
-    if (!qr) {
+    if (!qrData) {
       logger.info('QR not received, retrying with fresh auth', { sessionId });
       await this.connectSession(sessionId, { freshAuth: true });
-      qr = await this.waitForQR(sessionId, 45000);
+      qrData = await this.waitForQR(sessionId, 45000);
     }
 
-    return qr;
+    return qrData;
   }
 
   /**
@@ -850,6 +952,7 @@ class SessionManager {
     }
 
     await this.clearSessionAuth(sessionId);
+    this.deleteQrImage(sessionId);
     await SessionModel.delete(sessionId);
     this.sessions.delete(sessionId);
 
@@ -914,7 +1017,7 @@ class SessionManager {
     return Array.from(this.sessions.values()).map((s) => ({
       sessionId: s.sessionId,
       status: s.status,
-      hasQR: !!s.qr,
+      hasQR: !!s.qrImageUrl,
       hasPairingCode: !!s.pairingCode,
       reconnectAttempts: s.reconnectAttempts,
     }));

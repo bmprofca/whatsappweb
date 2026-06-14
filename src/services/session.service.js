@@ -91,15 +91,19 @@ class SessionService {
     const db = await SessionModel.findBySessionId(sessionId);
     if (!db) throw new AppError('Session not found', 404);
 
-    const qr = await sessionManager.getQR(sessionId);
-    if (!qr) {
+    const qrData = await sessionManager.getQR(sessionId);
+    if (!qrData) {
       throw new AppError(
         'QR code could not be generated. Delete the session, create again, and retry.',
         503,
       );
     }
 
-    return { sessionId, qr };
+    return {
+      sessionId,
+      imageName: qrData.imageName,
+      imageUrl: qrData.imageUrl,
+    };
   }
 
   /**
