@@ -2,12 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import NodeCache from '@cacheable/node-cache';
+
 import makeWASocket, {
   Browsers,
   DisconnectReason,
   downloadMediaMessage,
   fetchLatestBaileysVersion,
-  fetchLatestWaWebVersion,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
@@ -16,9 +17,10 @@ import QRCode from 'qrcode';
 
 import env from '../config/env.js';
 import { AuthModel } from '../database/models/auth.model.js';
-import { MessageLogModel } from '../database/models/messageLog.model.js';
 import { SessionModel } from '../database/models/session.model.js';
 import { fromJid, isFromMe, parseMessageContent, sleep, toJid } from '../utils/helpers.js';
+import { MessageStore } from '../utils/message-store.js';
+import { wrapKeyStoreWithBackup } from '../utils/auth-store.js';
 import logger from '../utils/logger.js';
 import { AppError } from '../utils/errors.js';
 
@@ -33,7 +35,7 @@ let cachedWaVersion = null;
 let versionFetchedAt = 0;
 const VERSION_TTL_MS = 60 * 60 * 1000;
 
-/** @typedef {'disconnected' | 'connecting' | 'qr' | 'pairing' | 'connected' | 'destroyed'} SessionStatus */
+/** @typedef {'disconnected' | 'connecting' | 'qr' | 'pairing' | 'connected' | 'conflict' | 'destroyed'} SessionStatus */
 
 /**
  * @typedef {object} SessionInstance
@@ -49,6 +51,8 @@ const VERSION_TTL_MS = 60 * 60 * 1000;
  * @property {boolean} isDestroying
  * @property {NodeJS.Timeout | null} reconnectTimer
  * @property {Function | null} saveCreds
+ * @property {MessageStore} messageStore
+ * @property {NodeJS.Timeout | null} authBackupTimer
  */
 
 /**
@@ -76,7 +80,8 @@ class SessionManager {
   }
 
   /**
-   * Fetch latest WhatsApp Web version (cached for 1 hour)
+   * Resolve WhatsApp Web version from Baileys (cached for 1 hour).
+   * Avoid fetchLatestWaWebVersion — it can cause encryption incompatibilities.
    * @param {boolean} [force]
    * @returns {Promise<[number, number, number]>}
    */
@@ -86,21 +91,46 @@ class SessionManager {
       return cachedWaVersion;
     }
 
+    const { version } = await fetchLatestBaileysVersion();
+    cachedWaVersion = version;
+    versionFetchedAt = now;
+    logger.info('WhatsApp Web version resolved', { version, source: 'baileys' });
+    return version;
+  }
+
+  /**
+   * Resolve recipient JID via WhatsApp before sending
+   * @param {import('@whiskeysockets/baileys').WASocket} socket
+   * @param {string} number
+   * @returns {Promise<string>}
+   */
+  async resolveRecipientJid(socket, number) {
+    const jid = toJid(number);
+
     try {
-      const { version, isLatest } = await fetchLatestWaWebVersion({});
-      cachedWaVersion = version;
-      versionFetchedAt = now;
-      logger.info('WhatsApp Web version resolved', { version, isLatest });
-      return version;
+      const results = await socket.onWhatsApp(jid);
+      const match = results?.find((entry) => entry.exists && entry.jid);
+      if (match?.jid) return match.jid;
     } catch (error) {
-      logger.warn('fetchLatestWaWebVersion failed, falling back to Baileys version', {
+      logger.warn('Failed to resolve WhatsApp JID, using phone JID', {
+        number,
         error: error.message,
       });
-      const { version } = await fetchLatestBaileysVersion();
-      cachedWaVersion = version;
-      versionFetchedAt = now;
-      return version;
     }
+
+    return jid;
+  }
+
+  /**
+   * Resolve JID and sync encryption pre-keys before sending
+   * @param {import('@whiskeysockets/baileys').WASocket} socket
+   * @param {string} number
+   * @returns {Promise<string>}
+   */
+  async prepareForSend(socket, number) {
+    const jid = await this.resolveRecipientJid(socket, number);
+    await socket.uploadPreKeysToServerIfRequired();
+    return jid;
   }
 
   /**
@@ -260,6 +290,65 @@ class SessionManager {
   }
 
   /**
+   * Debounce auth backup after signal key updates
+   * @param {string} sessionId
+   */
+  scheduleAuthBackup(sessionId) {
+    const instance = this.getOrCreateInstance(sessionId);
+    if (instance.authBackupTimer) {
+      clearTimeout(instance.authBackupTimer);
+    }
+
+    instance.authBackupTimer = setTimeout(async () => {
+      instance.authBackupTimer = null;
+      await this.backupAuthToDb(sessionId);
+    }, 500);
+  }
+
+  /**
+   * Ensure local auth files exist; restore from DB only on cold start
+   * @param {string} sessionId
+   * @returns {Promise<boolean>}
+   */
+  async ensureAuthState(sessionId) {
+    this.ensureSessionDir(sessionId);
+    const authDir = this.getSessionPath(sessionId);
+    const localCredsPath = path.join(authDir, 'creds.json');
+
+    if (fs.existsSync(localCredsPath)) {
+      return true;
+    }
+
+    const restored = await this.restoreAuthFromDb(sessionId);
+    if (restored) {
+      logger.info('Restoring auth from database', { sessionId });
+    }
+    return restored;
+  }
+
+  /**
+   * Claim exclusive session ownership for this server
+   * @param {string} sessionId
+   */
+  async acquireSessionLock(sessionId) {
+    const acquired = await SessionModel.tryAcquireLock(sessionId, env.serverId);
+    if (!acquired) {
+      throw new AppError(
+        'Session is active on another server. Stop the other instance before connecting.',
+        409,
+      );
+    }
+  }
+
+  /**
+   * Release session ownership for this server
+   * @param {string} sessionId
+   */
+  async releaseSessionLock(sessionId) {
+    await SessionModel.releaseLock(sessionId, env.serverId);
+  }
+
+  /**
    * Cancel pending reconnect for a session
    * @param {string} sessionId
    */
@@ -375,9 +464,22 @@ class SessionManager {
         isDestroying: false,
         reconnectTimer: null,
         saveCreds: null,
+        messageStore: new MessageStore(),
+        authBackupTimer: null,
       });
     }
     return this.sessions.get(sessionId);
+  }
+
+  /**
+   * Store sent message for Baileys encryption retry handling
+   * @param {SessionInstance} instance
+   * @param {object} result
+   */
+  storeSentMessage(instance, result) {
+    if (result?.key && result?.message) {
+      instance.messageStore.save(result);
+    }
   }
 
   /**
@@ -457,30 +559,53 @@ class SessionManager {
     await this.updateSessionStatus(sessionId, 'connecting');
     this.emit('session.connecting', { sessionId, status: 'connecting' });
 
+    await this.acquireSessionLock(sessionId);
+    await this.ensureAuthState(sessionId);
+
     const authPath = this.getSessionPath(sessionId);
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
     instance.saveCreds = saveCreds;
 
     const version = await this.getWaVersion(options.freshAuth);
     const baileysLogger = pino({ level: 'silent' });
+    const keysWithBackup = wrapKeyStoreWithBackup(state.keys, () =>
+      this.scheduleAuthBackup(sessionId),
+    );
+    const msgRetryCounterCache = new NodeCache({
+      stdTTL: 3600,
+      useClones: false,
+    });
+
+    /** @type {import('@whiskeysockets/baileys').WASocket | null} */
+    let socketRef = null;
 
     const socket = makeWASocket({
       version,
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
+        keys: makeCacheableSignalKeyStore(keysWithBackup, baileysLogger),
       },
       printQRInTerminal: false,
-      browser: Browsers.ubuntu('WhatsApp API Server'),
+      browser: Browsers.macOS('Chrome'),
       syncFullHistory: false,
+      emitOwnEvents: true,
       markOnlineOnConnect: false,
-      generateHighQualityLinkPreview: true,
+      generateHighQualityLinkPreview: false,
       connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 30000,
       qrTimeout: 60000,
       logger: baileysLogger,
-      getMessage: async () => undefined,
+      msgRetryCounterCache,
+      getMessage: async (key) => instance.messageStore.get(key),
+      patchMessageBeforeSending: async (msg) => {
+        if (socketRef) {
+          await socketRef.uploadPreKeysToServerIfRequired();
+        }
+        return msg;
+      },
     });
 
+    socketRef = socket;
     instance.socket = socket;
     this.setupEventHandlers(sessionId, socket, saveCreds);
 
@@ -542,6 +667,17 @@ class SessionManager {
 
         logger.info('Session connected', { sessionId, phone });
 
+        try {
+          await socket.uploadPreKeysToServerIfRequired();
+          await saveCreds();
+          await this.backupAuthToDb(sessionId);
+        } catch (error) {
+          logger.warn('Post-connect auth sync failed', {
+            sessionId,
+            error: error.message,
+          });
+        }
+
         const dbSession = await SessionModel.findBySessionId(sessionId);
         if (dbSession?.webhook_url) {
           await webhookService.send(dbSession.webhook_url, 'session.connected', {
@@ -554,6 +690,22 @@ class SessionManager {
 
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
+
+        if (statusCode === DisconnectReason.connectionReplaced) {
+          this.cancelReconnect(sessionId);
+          await this.releaseSessionLock(sessionId);
+          await this.updateSessionStatus(sessionId, 'conflict');
+          this.emit('session.conflict', {
+            sessionId,
+            status: 'conflict',
+            reason: statusCode,
+          });
+          logger.error(
+            'Session replaced by another WhatsApp connection (440). Stop all other servers using this session, then re-pair with a fresh QR scan.',
+            { sessionId },
+          );
+          return;
+        }
 
         if (instance.isDestroying) {
           await this.updateSessionStatus(sessionId, 'destroyed');
@@ -614,6 +766,7 @@ class SessionManager {
         const shouldReconnect =
           !instance.isDestroying &&
           statusCode !== DisconnectReason.loggedOut &&
+          statusCode !== DisconnectReason.connectionReplaced &&
           statusCode !== 401;
 
         this.deleteQrImage(sessionId);
@@ -655,6 +808,10 @@ class SessionManager {
     });
 
     socket.ev.on('messages.upsert', async ({ messages, type }) => {
+      for (const msg of messages) {
+        instance.messageStore.save(msg);
+      }
+
       if (type !== 'notify') return;
 
       for (const msg of messages) {
@@ -683,16 +840,6 @@ class SessionManager {
         : fromJid(socket.user?.id);
 
       const messageId = msg.key.id;
-
-      await MessageLogModel.create({
-        sessionId,
-        messageId,
-        direction,
-        sender,
-        receiver,
-        messageType,
-        messageText,
-      });
 
       let mediaUrl = null;
       if (['image', 'video', 'audio', 'document', 'sticker'].includes(messageType)) {
@@ -866,9 +1013,11 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendText(sessionId, number, message) {
+    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
-    const jid = toJid(number);
+    const jid = await this.prepareForSend(socket, number);
     const result = await socket.sendMessage(jid, { text: message });
+    this.storeSentMessage(instance, result);
     return result;
   }
 
@@ -880,9 +1029,12 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendImage(sessionId, number, { url, caption }) {
+    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
-    const jid = toJid(number);
-    return socket.sendMessage(jid, { image: { url }, caption: caption || '' });
+    const jid = await this.prepareForSend(socket, number);
+    const result = await socket.sendMessage(jid, { image: { url }, caption: caption || '' });
+    this.storeSentMessage(instance, result);
+    return result;
   }
 
   /**
@@ -893,14 +1045,17 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendDocument(sessionId, number, { url, fileName, mimetype, caption }) {
+    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
-    const jid = toJid(number);
-    return socket.sendMessage(jid, {
+    const jid = await this.prepareForSend(socket, number);
+    const result = await socket.sendMessage(jid, {
       document: { url },
       fileName: fileName || 'document',
       mimetype: mimetype || 'application/pdf',
       caption: caption || '',
     });
+    this.storeSentMessage(instance, result);
+    return result;
   }
 
   /**
@@ -911,13 +1066,16 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendAudio(sessionId, number, { url, ptt, mimetype }) {
+    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
-    const jid = toJid(number);
-    return socket.sendMessage(jid, {
+    const jid = await this.prepareForSend(socket, number);
+    const result = await socket.sendMessage(jid, {
       audio: { url },
       mimetype: mimetype || 'audio/mpeg',
       ptt: ptt || false,
     });
+    this.storeSentMessage(instance, result);
+    return result;
   }
 
   /**
@@ -928,9 +1086,12 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendVideo(sessionId, number, { url, caption }) {
+    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
-    const jid = toJid(number);
-    return socket.sendMessage(jid, { video: { url }, caption: caption || '' });
+    const jid = await this.prepareForSend(socket, number);
+    const result = await socket.sendMessage(jid, { video: { url }, caption: caption || '' });
+    this.storeSentMessage(instance, result);
+    return result;
   }
 
   /**
@@ -941,9 +1102,10 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendLocation(sessionId, number, { latitude, longitude, name, address }) {
+    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
-    const jid = toJid(number);
-    return socket.sendMessage(jid, {
+    const jid = await this.prepareForSend(socket, number);
+    const result = await socket.sendMessage(jid, {
       location: {
         degreesLatitude: latitude,
         degreesLongitude: longitude,
@@ -951,6 +1113,8 @@ class SessionManager {
         address: address || '',
       },
     });
+    this.storeSentMessage(instance, result);
+    return result;
   }
 
   /**
@@ -1010,6 +1174,7 @@ class SessionManager {
     }
 
     await this.clearSessionAuth(sessionId);
+    await this.releaseSessionLock(sessionId);
     this.deleteQrImage(sessionId);
     await SessionModel.delete(sessionId);
     this.sessions.delete(sessionId);
@@ -1082,6 +1247,13 @@ class SessionManager {
 
           await sleep(1500);
         } catch (error) {
+          await this.releaseSessionLock(sessionId).catch(() => {});
+          if (error.statusCode === 409) {
+            logger.warn('Skipping session restore — owned by another server', {
+              sessionId,
+            });
+            continue;
+          }
           logger.error('Failed to restore session', {
             sessionId,
             error: error.message,
@@ -1120,6 +1292,7 @@ class SessionManager {
       connected: all.filter((s) => s.status === 'connected').length,
       connecting: all.filter((s) => s.status === 'connecting').length,
       disconnected: all.filter((s) => s.status === 'disconnected').length,
+      conflict: all.filter((s) => s.status === 'conflict').length,
       qr: all.filter((s) => s.status === 'qr').length,
       pairing: all.filter((s) => s.status === 'pairing').length,
       reconnectQueue: this.reconnectQueue.size,
@@ -1138,6 +1311,7 @@ class SessionManager {
       const instance = this.sessions.get(sessionId);
       if (instance) {
         instance.isDestroying = true;
+        if (instance.authBackupTimer) clearTimeout(instance.authBackupTimer);
         if (instance.reconnectTimer) clearTimeout(instance.reconnectTimer);
         if (instance.socket) {
           try {
@@ -1153,6 +1327,7 @@ class SessionManager {
 
     this.sessions.clear();
     this.reconnectQueue.clear();
+    await SessionModel.releaseAllLocksForServer(env.serverId);
   }
 }
 

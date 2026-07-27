@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import os from 'os';
 
 dotenv.config();
 
@@ -11,6 +12,7 @@ const env = {
   isProduction,
   isDevelopment: !isProduction,
   baseUrl: process.env.BASE_URL || 'http://localhost:3000',
+  serverId: process.env.SERVER_ID || process.env.BASE_URL || os.hostname(),
   apiKey: process.env.API_KEY || '',
   db: {
     host: process.env.DB_HOST || 'localhost',

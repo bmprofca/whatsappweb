@@ -1,7 +1,3 @@
-import { MessageLogModel } from '../database/models/messageLog.model.js';
-import { fromJid } from '../utils/helpers.js';
-import logger from '../utils/logger.js';
-
 import sessionManager from './session.manager.js';
 
 /**
@@ -9,13 +5,12 @@ import sessionManager from './session.manager.js';
  */
 class WhatsAppService {
   /**
-   * Send text message and log it
+   * Send text message
    * @param {object} data
    * @returns {Promise<object>}
    */
   async sendText({ sessionId, number, message }) {
     const result = await sessionManager.sendText(sessionId, number, message);
-    await this.logOutgoingMessage(sessionId, number, 'text', message, result);
     return this.formatSendResult(result);
   }
 
@@ -26,7 +21,6 @@ class WhatsAppService {
    */
   async sendImage({ sessionId, number, url, caption }) {
     const result = await sessionManager.sendImage(sessionId, number, { url, caption });
-    await this.logOutgoingMessage(sessionId, number, 'image', caption || url, result);
     return this.formatSendResult(result);
   }
 
@@ -42,13 +36,6 @@ class WhatsAppService {
       mimetype,
       caption,
     });
-    await this.logOutgoingMessage(
-      sessionId,
-      number,
-      'document',
-      fileName || caption || url,
-      result,
-    );
     return this.formatSendResult(result);
   }
 
@@ -59,7 +46,6 @@ class WhatsAppService {
    */
   async sendAudio({ sessionId, number, url, ptt, mimetype }) {
     const result = await sessionManager.sendAudio(sessionId, number, { url, ptt, mimetype });
-    await this.logOutgoingMessage(sessionId, number, 'audio', url, result);
     return this.formatSendResult(result);
   }
 
@@ -70,7 +56,6 @@ class WhatsAppService {
    */
   async sendVideo({ sessionId, number, url, caption }) {
     const result = await sessionManager.sendVideo(sessionId, number, { url, caption });
-    await this.logOutgoingMessage(sessionId, number, 'video', caption || url, result);
     return this.formatSendResult(result);
   }
 
@@ -86,41 +71,7 @@ class WhatsAppService {
       name,
       address,
     });
-    const text = `Location: ${latitude}, ${longitude}`;
-    await this.logOutgoingMessage(sessionId, number, 'location', text, result);
     return this.formatSendResult(result);
-  }
-
-  /**
-   * Log outgoing message to database
-   * @param {string} sessionId
-   * @param {string} number
-   * @param {string} messageType
-   * @param {string} messageText
-   * @param {object} result
-   */
-  async logOutgoingMessage(sessionId, number, messageType, messageText, result) {
-    try {
-      const instance = sessionManager.sessions.get(sessionId);
-      const sender = instance?.socket?.user?.id
-        ? fromJid(instance.socket.user.id)
-        : sessionId;
-
-      await MessageLogModel.create({
-        sessionId,
-        messageId: result?.key?.id || `out_${Date.now()}`,
-        direction: 'OUT',
-        sender,
-        receiver: number,
-        messageType,
-        messageText,
-      });
-    } catch (error) {
-      logger.error('Failed to log outgoing message', {
-        sessionId,
-        error: error.message,
-      });
-    }
   }
 
   /**

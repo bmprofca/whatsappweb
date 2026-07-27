@@ -10,6 +10,9 @@ import reconnectJob from './src/jobs/reconnect.job.js';
 import cleanupJob from './src/jobs/cleanup.job.js';
 import sessionManager from './src/services/session.manager.js';
 import { initSocket } from './src/sockets/socket.js';
+import { suppressRecoverableSignalLogs } from './src/utils/auth-store.js';
+
+suppressRecoverableSignalLogs();
 
 const server = http.createServer(app);
 

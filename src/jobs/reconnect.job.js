@@ -44,7 +44,7 @@ class ReconnectJob {
 
       for (const dbSession of dbSessions) {
         const sessionId = dbSession.session_id;
-        let instance = sessionManager.sessions.get(sessionId);
+        const instance = sessionManager.sessions.get(sessionId);
 
         // Session missing from memory after crash/restart — bring it back
         if (!instance) {
@@ -59,6 +59,7 @@ class ReconnectJob {
           try {
             await sessionManager.connectSession(sessionId);
           } catch (error) {
+            if (error.statusCode === 409) continue;
             logger.error('Reconnect job failed to restore session', {
               sessionId,
               error: error.message,
@@ -67,6 +68,7 @@ class ReconnectJob {
           continue;
         }
 
+        if (instance.status === 'conflict') continue;
         if (instance.status !== 'disconnected') continue;
         if (instance.reconnectAttempts >= 10) continue;
 
@@ -77,6 +79,7 @@ class ReconnectJob {
           });
           await sessionManager.reconnectSession(sessionId);
         } catch (error) {
+          if (error.statusCode === 409) continue;
           logger.error('Reconnect job failed', {
             sessionId,
             error: error.message,
