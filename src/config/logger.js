@@ -13,7 +13,7 @@ const logFormat = winston.format.combine(
 );
 
 const logger = winston.createLogger({
-  level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
+  level: 'info',
   format: logFormat,
   defaultMeta: { service: 'whatsapp-server' },
   transports: [
@@ -28,21 +28,19 @@ const logger = winston.createLogger({
       maxsize: 10 * 1024 * 1024,
       maxFiles: 10,
     }),
-  ],
-});
-
-if (process.env.NODE_ENV !== 'production') {
-  logger.add(
+    // Console: errors only
     new winston.transports.Console({
+      level: 'error',
       format: winston.format.combine(
         winston.format.colorize(),
         winston.format.printf(({ timestamp, level, message, ...meta }) => {
-          const metaStr = Object.keys(meta).length ? ` ${JSON.stringify(meta)}` : '';
+          const { service, ...rest } = meta;
+          const metaStr = Object.keys(rest).length ? ` ${JSON.stringify(rest)}` : '';
           return `${timestamp} [${level}]: ${message}${metaStr}`;
         }),
       ),
     }),
-  );
-}
+  ],
+});
 
 export default logger;

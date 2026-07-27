@@ -45,6 +45,7 @@ const VERSION_TTL_MS = 60 * 60 * 1000;
  * @property {string | null} qrImageUrl
  * @property {string | null} pairingCode
  * @property {number} reconnectAttempts
+ * @property {number | null} disconnectedAt
  * @property {boolean} isDestroying
  * @property {NodeJS.Timeout | null} reconnectTimer
  * @property {Function | null} saveCreds
@@ -283,10 +284,54 @@ class SessionManager {
   }
 
   /**
+   * Check if session has valid creds.json
+   * @param {string} sessionId
+   * @returns {boolean}
+   */
+  hasCredsFile(sessionId) {
+    return fs.existsSync(path.join(this.getSessionPath(sessionId), 'creds.json'));
+  }
+
+  /**
+   * Read whether session auth is registered (logged in before)
+   * @param {string} sessionId
+   * @returns {boolean}
+   */
+  isAuthRegistered(sessionId) {
+    try {
+      const credsPath = path.join(this.getSessionPath(sessionId), 'creds.json');
+      if (!fs.existsSync(credsPath)) return false;
+      const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+      return !!(creds?.registered || creds?.me?.id);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Wait until session connects or timeout
+   * @param {string} sessionId
+   * @param {number} timeoutMs
+   * @returns {Promise<boolean>}
+   */
+  async waitForConnection(sessionId, timeoutMs = 30000) {
+    const instance = this.getOrCreateInstance(sessionId);
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      if (instance.status === 'connected') return true;
+      if (instance.status === 'qr' || instance.status === 'pairing') return false;
+      await sleep(500);
+    }
+
+    return instance.status === 'connected';
+  }
+
+  /**
    * Wait until QR is generated or timeout
    * @param {string} sessionId
    * @param {number} timeoutMs
-   * @returns {Promise<string | null>}
+   * @returns {Promise<{ imageName: string, imageUrl: string } | null>}
    */
   async waitForQR(sessionId, timeoutMs = 60000) {
     const instance = this.getOrCreateInstance(sessionId);
@@ -326,6 +371,7 @@ class SessionManager {
         qrImageUrl: null,
         pairingCode: null,
         reconnectAttempts: 0,
+        disconnectedAt: null,
         isDestroying: false,
         reconnectTimer: null,
         saveCreds: null,
@@ -479,12 +525,14 @@ class SessionManager {
         this.deleteQrImage(sessionId);
         instance.pairingCode = null;
         instance.reconnectAttempts = 0;
+        instance.disconnectedAt = null;
         this.reconnectQueue.delete(sessionId);
 
         const phone = socket.user?.id ? fromJid(socket.user.id) : null;
         const displayName = socket.user?.name || socket.user?.verifiedName || null;
 
         await this.updateSessionStatus(sessionId, 'connected', { phone, displayName });
+        await this.backupAuthToDb(sessionId);
         this.emit('session.connected', {
           sessionId,
           status: 'connected',
@@ -570,6 +618,10 @@ class SessionManager {
 
         this.deleteQrImage(sessionId);
 
+        if (!instance.disconnectedAt) {
+          instance.disconnectedAt = Date.now();
+        }
+
         await this.updateSessionStatus(sessionId, 'disconnected');
         this.emit('session.disconnected', {
           sessionId,
@@ -578,6 +630,12 @@ class SessionManager {
         });
 
         logger.warn('Session disconnected', { sessionId, statusCode, shouldReconnect });
+
+        try {
+          await this.backupAuthToDb(sessionId);
+        } catch {
+          // ignore backup errors on disconnect
+        }
 
         const dbSession = await SessionModel.findBySessionId(sessionId);
         if (dbSession?.webhook_url) {
@@ -670,7 +728,7 @@ class SessionManager {
       const eventName = fromMe ? 'message.sent' : 'message.received';
       this.emit(eventName, payload);
 
-      logger.info('Message processed', { sessionId, messageId, direction, messageType });
+      logger.info('Message processed', { event: eventName, payload });
 
       const dbSession = await SessionModel.findBySessionId(sessionId);
       if (dbSession?.webhook_url) {
@@ -972,7 +1030,7 @@ class SessionManager {
   }
 
   /**
-   * Restore all sessions from database on startup
+   * Restore all logged-in sessions from database/filesystem on startup
    * @returns {Promise<void>}
    */
   async restoreSessions() {
@@ -984,24 +1042,51 @@ class SessionManager {
       logger.info(`Restoring ${sessions.length} sessions from database`);
 
       for (const session of sessions) {
-        try {
-          const hasAuth =
-            fs.existsSync(this.getSessionPath(session.session_id)) ||
-            (await this.restoreAuthFromDb(session.session_id));
+        const sessionId = session.session_id;
 
-          if (hasAuth) {
-            await this.connectSession(session.session_id);
-            await new Promise((resolve) => setTimeout(resolve, 2000));
-          } else {
-            logger.info('No auth data found, skipping restore', {
-              sessionId: session.session_id,
-            });
+        try {
+          if (!this.hasCredsFile(sessionId)) {
+            const restored = await this.restoreAuthFromDb(sessionId);
+            if (!restored) {
+              logger.warn('No auth data found, skipping restore', { sessionId });
+              continue;
+            }
           }
+
+          if (!this.isAuthRegistered(sessionId)) {
+            logger.warn('Auth exists but session is not registered, skipping restore', {
+              sessionId,
+            });
+            continue;
+          }
+
+          logger.info('Restoring session connection', { sessionId, phone: session.phone });
+
+          const instance = this.getOrCreateInstance(sessionId);
+          instance.reconnectAttempts = 0;
+          instance.isDestroying = false;
+
+          await this.connectSession(sessionId);
+          const connected = await this.waitForConnection(sessionId, 45000);
+
+          if (connected) {
+            logger.info('Session restored and connected', { sessionId });
+            await this.backupAuthToDb(sessionId);
+          } else {
+            logger.warn('Session restore did not reach connected state, will retry via reconnect job', {
+              sessionId,
+              status: instance.status,
+            });
+            this.scheduleReconnect(sessionId);
+          }
+
+          await sleep(1500);
         } catch (error) {
           logger.error('Failed to restore session', {
-            sessionId: session.session_id,
+            sessionId,
             error: error.message,
           });
+          this.scheduleReconnect(sessionId);
         }
       }
     } finally {
@@ -1020,6 +1105,7 @@ class SessionManager {
       hasQR: !!s.qrImageUrl,
       hasPairingCode: !!s.pairingCode,
       reconnectAttempts: s.reconnectAttempts,
+      disconnectedAt: s.disconnectedAt,
     }));
   }
 

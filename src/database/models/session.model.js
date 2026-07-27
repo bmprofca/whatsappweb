@@ -13,8 +13,9 @@ export const SessionModel = {
    */
   async create({ sessionId, webhookUrl = null, pairingCodeEnabled = 0 }) {
     await execute(
-      `INSERT INTO whatsapp_sessions (session_id, status, webhook_url, pairing_code_enabled, created_at, updated_at)
-       VALUES (?, 'disconnected', ?, ?, NOW(), NOW())`,
+      `INSERT INTO whatsapp_sessions
+       (session_id, status, webhook_url, pairing_code_enabled, created_at, updated_at, disconnected_at)
+       VALUES (?, 'disconnected', ?, ?, NOW(), NOW(), NOW())`,
       [sessionId, webhookUrl, pairingCodeEnabled ? 1 : 0],
     );
     return this.findBySessionId(sessionId);
@@ -38,14 +39,32 @@ export const SessionModel = {
   },
 
   /**
-   * Get sessions that should be restored on startup
+   * Get sessions that should be restored on startup (previously logged in)
    * @returns {Promise<object[]>}
    */
   async findRestorable() {
     return query(
       `SELECT * FROM whatsapp_sessions
-       WHERE status IN ('connected', 'connecting', 'disconnected', 'qr', 'pairing')
+       WHERE phone IS NOT NULL AND phone != ''
+         AND status IN ('connected', 'connecting', 'disconnected')
        ORDER BY created_at ASC`,
+    );
+  },
+
+  /**
+   * Find sessions disconnected longer than the given minutes
+   * @param {number} minutes
+   * @returns {Promise<object[]>}
+   */
+  async findStaleDisconnected(minutes = 30) {
+    return query(
+      `SELECT * FROM whatsapp_sessions
+       WHERE status = 'disconnected'
+         AND (
+           (disconnected_at IS NOT NULL AND disconnected_at <= DATE_SUB(NOW(), INTERVAL ? MINUTE))
+           OR (disconnected_at IS NULL AND updated_at <= DATE_SUB(NOW(), INTERVAL ? MINUTE))
+         )`,
+      [minutes, minutes],
     );
   },
 
@@ -60,6 +79,12 @@ export const SessionModel = {
     const fields = ['status = ?', 'updated_at = NOW()'];
     const params = [status];
 
+    if (status === 'disconnected') {
+      fields.push('disconnected_at = COALESCE(disconnected_at, NOW())');
+    } else if (status === 'connected') {
+      fields.push('disconnected_at = NULL');
+    }
+
     if (extra.phone !== undefined) {
       fields.push('phone = ?');
       params.push(extra.phone);
@@ -71,6 +96,9 @@ export const SessionModel = {
     if (extra.webhookUrl !== undefined) {
       fields.push('webhook_url = ?');
       params.push(extra.webhookUrl);
+    }
+    if (extra.forceDisconnectedAt) {
+      fields.push('disconnected_at = NOW()');
     }
 
     params.push(sessionId);

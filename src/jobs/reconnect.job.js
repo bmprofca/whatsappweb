@@ -3,7 +3,7 @@ import sessionManager from '../services/session.manager.js';
 import logger from '../utils/logger.js';
 
 /**
- * Reconnect job - periodically checks disconnected sessions and attempts reconnect
+ * Reconnect job - periodically reconnects logged-in but disconnected sessions
  */
 class ReconnectJob {
   constructor() {
@@ -36,30 +36,55 @@ class ReconnectJob {
   }
 
   /**
-   * Run reconnect check — only for sessions that were previously logged in
+   * Reconnect previously logged-in sessions that are currently disconnected
    */
   async run() {
-    const sessions = sessionManager.getAllSessions();
-    const disconnected = sessions.filter((s) => s.status === 'disconnected');
+    try {
+      const dbSessions = await SessionModel.findRestorable();
 
-    for (const session of disconnected) {
-      if (session.reconnectAttempts >= 10) continue;
+      for (const dbSession of dbSessions) {
+        const sessionId = dbSession.session_id;
+        let instance = sessionManager.sessions.get(sessionId);
 
-      try {
-        const dbSession = await SessionModel.findBySessionId(session.sessionId);
-        // Skip sessions that never completed login (still waiting for QR)
-        if (!dbSession?.phone) continue;
+        // Session missing from memory after crash/restart — bring it back
+        if (!instance) {
+          if (!sessionManager.hasCredsFile(sessionId)) {
+            const restored = await sessionManager.restoreAuthFromDb(sessionId);
+            if (!restored || !sessionManager.isAuthRegistered(sessionId)) {
+              continue;
+            }
+          }
 
-        logger.info('Reconnect job attempting reconnect', {
-          sessionId: session.sessionId,
-        });
-        await sessionManager.reconnectSession(session.sessionId);
-      } catch (error) {
-        logger.error('Reconnect job failed', {
-          sessionId: session.sessionId,
-          error: error.message,
-        });
+          logger.info('Reconnect job restoring missing session into memory', { sessionId });
+          try {
+            await sessionManager.connectSession(sessionId);
+          } catch (error) {
+            logger.error('Reconnect job failed to restore session', {
+              sessionId,
+              error: error.message,
+            });
+          }
+          continue;
+        }
+
+        if (instance.status !== 'disconnected') continue;
+        if (instance.reconnectAttempts >= 10) continue;
+
+        try {
+          logger.info('Reconnect job attempting reconnect', {
+            sessionId,
+            attempt: instance.reconnectAttempts + 1,
+          });
+          await sessionManager.reconnectSession(sessionId);
+        } catch (error) {
+          logger.error('Reconnect job failed', {
+            sessionId,
+            error: error.message,
+          });
+        }
       }
+    } catch (error) {
+      logger.error('Reconnect job run failed', { error: error.message });
     }
   }
 }

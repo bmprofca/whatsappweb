@@ -7,6 +7,7 @@ import { closePool, initializeDatabase, testConnection } from './src/config/data
 import env from './src/config/env.js';
 import logger from './src/config/logger.js';
 import reconnectJob from './src/jobs/reconnect.job.js';
+import cleanupJob from './src/jobs/cleanup.job.js';
 import sessionManager from './src/services/session.manager.js';
 import { initSocket } from './src/sockets/socket.js';
 
@@ -41,6 +42,7 @@ async function start() {
 
       await sessionManager.restoreSessions();
       reconnectJob.start(60000);
+      cleanupJob.start(60 * 60 * 1000);
     });
   } catch (error) {
     logger.error('Failed to start server', { error: error.message });
@@ -59,6 +61,7 @@ async function shutdown(signal) {
   logger.info(`${signal} received. Starting graceful shutdown...`);
 
   reconnectJob.stop();
+  cleanupJob.stop();
 
   server.close(async () => {
     logger.info('HTTP server closed');
