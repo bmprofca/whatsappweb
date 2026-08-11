@@ -1,6 +1,7 @@
 node_modules/
 .env
 logs/
+WHATSAPP_V2/
 src/storage/sessions/*
 !src/storage/sessions/.gitkeep
 src/storage/qr/*

@@ -2,14 +2,10 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import NodeCache from '@cacheable/node-cache';
-
 import makeWASocket, {
-  Browsers,
   DisconnectReason,
   downloadMediaMessage,
   fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
@@ -19,8 +15,6 @@ import env from '../config/env.js';
 import { AuthModel } from '../database/models/auth.model.js';
 import { SessionModel } from '../database/models/session.model.js';
 import { fromJid, isFromMe, parseMessageContent, sleep, toJid } from '../utils/helpers.js';
-import { MessageStore } from '../utils/message-store.js';
-import { wrapKeyStoreWithBackup } from '../utils/auth-store.js';
 import logger from '../utils/logger.js';
 import { AppError } from '../utils/errors.js';
 
@@ -29,6 +23,9 @@ import webhookService from './webhook.service.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSIONS_DIR = path.join(__dirname, '../storage/sessions');
 const QR_DIR = path.join(__dirname, '../storage/qr');
+
+/** Baileys logger — errors only (matches WHATSAPP_V2) */
+const baileysLogger = pino({ level: 'error' });
 
 /** @type {[number, number, number] | null} */
 let cachedWaVersion = null;
@@ -51,7 +48,6 @@ const VERSION_TTL_MS = 60 * 60 * 1000;
  * @property {boolean} isDestroying
  * @property {NodeJS.Timeout | null} reconnectTimer
  * @property {Function | null} saveCreds
- * @property {MessageStore} messageStore
  * @property {NodeJS.Timeout | null} authBackupTimer
  */
 
@@ -122,15 +118,13 @@ class SessionManager {
   }
 
   /**
-   * Resolve JID and sync encryption pre-keys before sending
+   * Resolve WhatsApp JID before sending (V2-compatible)
    * @param {import('@whiskeysockets/baileys').WASocket} socket
    * @param {string} number
    * @returns {Promise<string>}
    */
   async prepareForSend(socket, number) {
-    const jid = await this.resolveRecipientJid(socket, number);
-    await socket.uploadPreKeysToServerIfRequired();
-    return jid;
+    return this.resolveRecipientJid(socket, number);
   }
 
   /**
@@ -192,7 +186,11 @@ class SessionManager {
     const filePath = this.getQrImagePath(sessionId);
     const imageUrl = this.getQrImageUrl(sessionId);
 
-    await QRCode.toFile(filePath, qrString, { width: 300, margin: 2 });
+    await QRCode.toFile(filePath, qrString, {
+      errorCorrectionLevel: 'H',
+      width: 300,
+      margin: 2,
+    });
 
     const instance = this.getOrCreateInstance(sessionId);
     instance.qrImageName = imageName;
@@ -464,22 +462,10 @@ class SessionManager {
         isDestroying: false,
         reconnectTimer: null,
         saveCreds: null,
-        messageStore: new MessageStore(),
         authBackupTimer: null,
       });
     }
     return this.sessions.get(sessionId);
-  }
-
-  /**
-   * Store sent message for Baileys encryption retry handling
-   * @param {SessionInstance} instance
-   * @param {object} result
-   */
-  storeSentMessage(instance, result) {
-    if (result?.key && result?.message) {
-      instance.messageStore.save(result);
-    }
   }
 
   /**
@@ -567,45 +553,19 @@ class SessionManager {
     instance.saveCreds = saveCreds;
 
     const version = await this.getWaVersion(options.freshAuth);
-    const baileysLogger = pino({ level: 'silent' });
-    const keysWithBackup = wrapKeyStoreWithBackup(state.keys, () =>
-      this.scheduleAuthBackup(sessionId),
-    );
-    const msgRetryCounterCache = new NodeCache({
-      stdTTL: 3600,
-      useClones: false,
-    });
 
-    /** @type {import('@whiskeysockets/baileys').WASocket | null} */
-    let socketRef = null;
-
+    // WHATSAPP_V2-style socket config (Baileys 7.0.0-rc.6)
     const socket = makeWASocket({
       version,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(keysWithBackup, baileysLogger),
-      },
+      auth: state,
       printQRInTerminal: false,
-      browser: Browsers.macOS('Chrome'),
-      syncFullHistory: false,
-      emitOwnEvents: true,
-      markOnlineOnConnect: false,
-      generateHighQualityLinkPreview: false,
+      logger: baileysLogger,
       connectTimeoutMs: 60000,
       keepAliveIntervalMs: 30000,
-      qrTimeout: 60000,
-      logger: baileysLogger,
-      msgRetryCounterCache,
-      getMessage: async (key) => instance.messageStore.get(key),
-      patchMessageBeforeSending: async (msg) => {
-        if (socketRef) {
-          await socketRef.uploadPreKeysToServerIfRequired();
-        }
-        return msg;
-      },
+      markOnlineOnConnect: false,
+      getMessage: async () => undefined,
     });
 
-    socketRef = socket;
     instance.socket = socket;
     this.setupEventHandlers(sessionId, socket, saveCreds);
 
@@ -668,11 +628,9 @@ class SessionManager {
         logger.info('Session connected', { sessionId, phone });
 
         try {
-          await socket.uploadPreKeysToServerIfRequired();
-          await saveCreds();
-          await this.backupAuthToDb(sessionId);
+          await socket.sendPresenceUpdate('available');
         } catch (error) {
-          logger.warn('Post-connect auth sync failed', {
+          logger.warn('Failed to send initial presence', {
             sessionId,
             error: error.message,
           });
@@ -690,22 +648,7 @@ class SessionManager {
 
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-
-        if (statusCode === DisconnectReason.connectionReplaced) {
-          this.cancelReconnect(sessionId);
-          await this.releaseSessionLock(sessionId);
-          await this.updateSessionStatus(sessionId, 'conflict');
-          this.emit('session.conflict', {
-            sessionId,
-            status: 'conflict',
-            reason: statusCode,
-          });
-          logger.error(
-            'Session replaced by another WhatsApp connection (440). Stop all other servers using this session, then re-pair with a fresh QR scan.',
-            { sessionId },
-          );
-          return;
-        }
+        const errorMessage = lastDisconnect?.error?.message || '';
 
         if (instance.isDestroying) {
           await this.updateSessionStatus(sessionId, 'destroyed');
@@ -730,6 +673,44 @@ class SessionManager {
           await this.updateSessionStatus(sessionId, 'connecting');
           this.emit('session.connecting', { sessionId, status: 'connecting' });
           setTimeout(() => this.reconnectSession(sessionId), 1500);
+          return;
+        }
+
+        // V2-style permanent logout / conflict handling
+        const isPermanentLogout =
+          statusCode === DisconnectReason.loggedOut ||
+          statusCode === DisconnectReason.connectionReplaced ||
+          statusCode === 401 ||
+          errorMessage.includes('replaced') ||
+          errorMessage.includes('conflict');
+
+        if (isPermanentLogout) {
+          this.cancelReconnect(sessionId);
+          this.deleteQrImage(sessionId);
+          await this.releaseSessionLock(sessionId);
+
+          if (statusCode === DisconnectReason.connectionReplaced) {
+            await this.updateSessionStatus(sessionId, 'conflict');
+            this.emit('session.conflict', {
+              sessionId,
+              status: 'conflict',
+              reason: statusCode,
+            });
+            logger.error(
+              'Session replaced by another WhatsApp connection. Stop other servers and re-pair.',
+              { sessionId },
+            );
+            return;
+          }
+
+          await this.clearSessionAuth(sessionId);
+          await this.updateSessionStatus(sessionId, 'disconnected');
+          this.emit('session.disconnected', {
+            sessionId,
+            status: 'disconnected',
+            reason: statusCode,
+          });
+          logger.info('Session permanently logged out', { sessionId, statusCode });
           return;
         }
 
@@ -763,12 +744,6 @@ class SessionManager {
           return;
         }
 
-        const shouldReconnect =
-          !instance.isDestroying &&
-          statusCode !== DisconnectReason.loggedOut &&
-          statusCode !== DisconnectReason.connectionReplaced &&
-          statusCode !== 401;
-
         this.deleteQrImage(sessionId);
 
         if (!instance.disconnectedAt) {
@@ -782,7 +757,7 @@ class SessionManager {
           reason: statusCode,
         });
 
-        logger.warn('Session disconnected', { sessionId, statusCode, shouldReconnect });
+        logger.warn('Session disconnected', { sessionId, statusCode });
 
         try {
           await this.backupAuthToDb(sessionId);
@@ -798,20 +773,12 @@ class SessionManager {
           });
         }
 
-        if (shouldReconnect) {
-          this.scheduleReconnect(sessionId);
-        } else if (statusCode === DisconnectReason.loggedOut) {
-          logger.info('Session logged out', { sessionId });
-          await this.clearSessionAuth(sessionId);
-        }
+        // V2-style reconnect for temporary disconnects
+        this.scheduleReconnect(sessionId);
       }
     });
 
     socket.ev.on('messages.upsert', async ({ messages, type }) => {
-      for (const msg of messages) {
-        instance.messageStore.save(msg);
-      }
-
       if (type !== 'notify') return;
 
       for (const msg of messages) {
@@ -890,22 +857,25 @@ class SessionManager {
   }
 
   /**
-   * Schedule session reconnect with backoff
+   * Schedule session reconnect with V2-style backoff
+   * delay = min(5000 * attempt, 60000), max 10 retries for valid sessions
    * @param {string} sessionId
    */
   scheduleReconnect(sessionId) {
     const instance = this.getOrCreateInstance(sessionId);
 
     if (this.reconnectQueue.has(sessionId)) return;
-    if (instance.reconnectAttempts >= env.reconnect.maxAttempts) {
-      logger.error('Max reconnect attempts reached', { sessionId });
+
+    const maxRetries = this.hasCredsFile(sessionId) ? 10 : 5;
+    if (instance.reconnectAttempts >= maxRetries) {
+      logger.error('Max reconnect attempts reached', { sessionId, maxRetries });
       return;
     }
 
     this.reconnectQueue.add(sessionId);
     instance.reconnectAttempts += 1;
 
-    const delay = env.reconnect.delayMs * instance.reconnectAttempts;
+    const delayMs = Math.min(5000 * instance.reconnectAttempts, 60000);
 
     if (instance.reconnectTimer) {
       clearTimeout(instance.reconnectTimer);
@@ -919,12 +889,12 @@ class SessionManager {
         logger.error('Reconnect failed', { sessionId, error: error.message });
         this.scheduleReconnect(sessionId);
       }
-    }, delay);
+    }, delayMs);
 
     logger.info('Reconnect scheduled', {
       sessionId,
       attempt: instance.reconnectAttempts,
-      delayMs: delay,
+      delayMs,
     });
   }
 
@@ -958,6 +928,10 @@ class SessionManager {
 
     if (instance.socket.authState.creds.registered) {
       throw new AppError('Session already registered', 400);
+    }
+
+    if (typeof instance.socket.requestPairingCode !== 'function') {
+      throw new AppError('Pairing code is not supported by this Baileys build', 501);
     }
 
     const code = await instance.socket.requestPairingCode(phone);
@@ -1013,12 +987,9 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendText(sessionId, number, message) {
-    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
     const jid = await this.prepareForSend(socket, number);
-    const result = await socket.sendMessage(jid, { text: message });
-    this.storeSentMessage(instance, result);
-    return result;
+    return socket.sendMessage(jid, { text: message });
   }
 
   /**
@@ -1029,12 +1000,9 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendImage(sessionId, number, { url, caption }) {
-    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
     const jid = await this.prepareForSend(socket, number);
-    const result = await socket.sendMessage(jid, { image: { url }, caption: caption || '' });
-    this.storeSentMessage(instance, result);
-    return result;
+    return socket.sendMessage(jid, { image: { url }, caption: caption || '' });
   }
 
   /**
@@ -1045,17 +1013,14 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendDocument(sessionId, number, { url, fileName, mimetype, caption }) {
-    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
     const jid = await this.prepareForSend(socket, number);
-    const result = await socket.sendMessage(jid, {
+    return socket.sendMessage(jid, {
       document: { url },
       fileName: fileName || 'document',
       mimetype: mimetype || 'application/pdf',
       caption: caption || '',
     });
-    this.storeSentMessage(instance, result);
-    return result;
   }
 
   /**
@@ -1066,16 +1031,13 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendAudio(sessionId, number, { url, ptt, mimetype }) {
-    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
     const jid = await this.prepareForSend(socket, number);
-    const result = await socket.sendMessage(jid, {
+    return socket.sendMessage(jid, {
       audio: { url },
       mimetype: mimetype || 'audio/mpeg',
       ptt: ptt || false,
     });
-    this.storeSentMessage(instance, result);
-    return result;
   }
 
   /**
@@ -1086,12 +1048,9 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendVideo(sessionId, number, { url, caption }) {
-    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
     const jid = await this.prepareForSend(socket, number);
-    const result = await socket.sendMessage(jid, { video: { url }, caption: caption || '' });
-    this.storeSentMessage(instance, result);
-    return result;
+    return socket.sendMessage(jid, { video: { url }, caption: caption || '' });
   }
 
   /**
@@ -1102,10 +1061,9 @@ class SessionManager {
    * @returns {Promise<object>}
    */
   async sendLocation(sessionId, number, { latitude, longitude, name, address }) {
-    const instance = this.sessions.get(sessionId);
     const socket = this.getConnectedSocket(sessionId);
     const jid = await this.prepareForSend(socket, number);
-    const result = await socket.sendMessage(jid, {
+    return socket.sendMessage(jid, {
       location: {
         degreesLatitude: latitude,
         degreesLongitude: longitude,
@@ -1113,8 +1071,6 @@ class SessionManager {
         address: address || '',
       },
     });
-    this.storeSentMessage(instance, result);
-    return result;
   }
 
   /**
