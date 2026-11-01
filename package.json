@@ -1,18 +1,24 @@
 {
   "name": "wp",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "main": "server.js",
   "scripts": {
+    "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "On-demand WhatsApp send API",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "dependencies": {
     "@whiskeysockets/baileys": "^7.0.0-rc.6",
     "axios": "^1.13.1",
     "express": "^5.1.0",
+    "mime-types": "^3.0.1",
+    "pino": "^9.14.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0"
   }

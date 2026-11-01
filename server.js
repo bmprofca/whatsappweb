@@ -17,8 +17,13 @@ const {
 } = require('./sessionManager');
 
 const app = express();
-const PORT = 2580;
-const API_KEY = 'onedevelopers';
+const PORT = Number(process.env.PORT) || 2580;
+const API_KEY = process.env.API_KEY || 'onedevelopers';
+const API_VERSION = '1.2.0';
+const BAILEYS_VERSION = '7.0.0-rc.6';
+const HTTP_TIMEOUT_MS = 120000;
+const SESSION_ID_RE = /^[A-Z0-9]{6}$/;
+const DEFAULT_PUBLIC_BASE_URL = 'https://whatsappweb.onesaas.in';
 
 process.on('uncaughtException', (error) => {
     console.error('🟥 Uncaught Exception:', error);
@@ -32,8 +37,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 app.use((req, res, next) => {
-    const ms = 55000;
-    req.setTimeout(ms, () => {
+    req.setTimeout(HTTP_TIMEOUT_MS, () => {
         if (!res.headersSent) {
             res.status(408).json({
                 success: false,
@@ -42,7 +46,7 @@ app.use((req, res, next) => {
         }
         req.destroy();
     });
-    res.setTimeout(ms, () => {
+    res.setTimeout(HTTP_TIMEOUT_MS, () => {
         if (!res.headersSent) {
             res.status(408).json({
                 success: false,
@@ -66,15 +70,84 @@ function sendError(res, statusCode, code, message) {
     });
 }
 
+function parseSessionId(req, res) {
+    const session = String(req.params.session || '').trim();
+    if (!SESSION_ID_RE.test(session)) {
+        sendError(res, 400, 'INVALID_SESSION', 'Session id must be 6 uppercase letters or digits');
+        return null;
+    }
+    return session;
+}
+
 function toJid(phone) {
-    return phone.includes('@s.whatsapp.net') ? phone : `${phone}@s.whatsapp.net`;
+    const value = String(phone ?? '').trim();
+    if (!value) return '';
+    if (value.includes('@')) return value;
+    const digits = value.replace(/[^\d]/g, '');
+    return digits ? `${digits}@s.whatsapp.net` : '';
+}
+
+function publicBaseUrl(req) {
+    const configured = process.env.PUBLIC_BASE_URL;
+    if (configured) return configured.replace(/\/$/, '');
+    const host = req.get('x-forwarded-host') || req.get('host');
+    if (host) {
+        const proto = String(req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+        return `${proto}://${host}`;
+    }
+    return DEFAULT_PUBLIC_BASE_URL;
+}
+
+function assertSafeMediaUrl(file) {
+    let url;
+    try {
+        url = new URL(String(file || ''));
+    } catch {
+        const error = new Error('file must be a valid http or https URL');
+        error.code = 'INVALID_PARAMETER';
+        throw error;
+    }
+
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+        const error = new Error('file must be an http or https URL');
+        error.code = 'INVALID_PARAMETER';
+        throw error;
+    }
+
+    const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    const blocked =
+        hostname === 'localhost' ||
+        hostname === '::1' ||
+        hostname === '0.0.0.0' ||
+        hostname.endsWith('.local') ||
+        hostname === '169.254.169.254' ||
+        hostname === 'metadata.google.internal' ||
+        /^127\./.test(hostname) ||
+        /^10\./.test(hostname) ||
+        /^192\.168\./.test(hostname) ||
+        /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname);
+
+    if (blocked) {
+        const error = new Error('file URL must not point to a private or local address');
+        error.code = 'INVALID_PARAMETER';
+        throw error;
+    }
+
+    return url.toString();
 }
 
 function mapConnectError(err) {
     if (err.code === 'NEEDS_QR' || err.code === 'SESSION_NOT_FOUND') {
-        return { status: 404, code: err.code === 'NEEDS_QR' ? 'NEEDS_QR' : 'SESSION_NOT_FOUND', message: err.message };
+        return { status: 404, code: err.code, message: err.message };
     }
-    if (err.message && err.message.toLowerCase().includes('timeout')) {
+    const message = String(err.message || '').toLowerCase();
+    if (message.includes('send timeout')) {
+        return { status: 504, code: 'SEND_TIMEOUT', message: err.message };
+    }
+    if (message.includes('read timeout')) {
+        return { status: 504, code: 'READ_TIMEOUT', message: err.message };
+    }
+    if (message.includes('timeout')) {
         return { status: 504, code: 'CONNECT_TIMEOUT', message: err.message };
     }
     return { status: 500, code: 'INTERNAL_ERROR', message: err.message };
@@ -94,9 +167,9 @@ app.use((req, res, next) => {
 
 app.get('/', (req, res) => {
     return sendSuccess(res, 200, 'WhatsApp API Server is running', {
-        version: '1.2.0',
+        version: API_VERSION,
         mode: 'on-demand',
-        baileys: '6.7.18',
+        baileys: BAILEYS_VERSION,
         timestamp: new Date().toISOString()
     });
 });
@@ -127,7 +200,8 @@ app.post('/sessions', async (req, res) => {
 });
 
 app.get('/sessions/:session', async (req, res) => {
-    const { session } = req.params;
+    const session = parseSessionId(req, res);
+    if (!session) return;
 
     try {
         const data = await probeSession(session);
@@ -149,7 +223,8 @@ app.get('/sessions/:session', async (req, res) => {
 });
 
 app.get('/sessions/:session/qr', async (req, res) => {
-    const { session } = req.params;
+    const session = parseSessionId(req, res);
+    if (!session) return;
 
     try {
         const imagePath = path.join(__dirname, 'qrs', `${session}.png`);
@@ -159,7 +234,7 @@ app.get('/sessions/:session/qr', async (req, res) => {
 
         return sendSuccess(res, 200, 'Scan this QR code within 60 seconds', {
             session,
-            qr: `https://whatsappweb.onesaas.in/qrs/${session}.png`
+            qr: `${publicBaseUrl(req)}/qrs/${session}.png`
         });
     } catch (err) {
         console.error(`Error getting QR for session ${session}:`, err);
@@ -168,7 +243,8 @@ app.get('/sessions/:session/qr', async (req, res) => {
 });
 
 app.delete('/sessions/:session', (req, res) => {
-    const { session } = req.params;
+    const session = parseSessionId(req, res);
+    if (!session) return;
 
     try {
         removeSession(session);
@@ -180,7 +256,8 @@ app.delete('/sessions/:session', (req, res) => {
 });
 
 app.post('/sessions/:session/reconnect', async (req, res) => {
-    const { session } = req.params;
+    const session = parseSessionId(req, res);
+    if (!session) return;
 
     try {
         const data = await reconnectSession(session);
@@ -195,15 +272,17 @@ app.post('/sessions/:session/reconnect', async (req, res) => {
 });
 
 app.post('/sessions/:session/messages', async (req, res) => {
-    const { session } = req.params;
+    const session = parseSessionId(req, res);
+    if (!session) return;
     const { phone, message } = req.body || {};
+    const jid = toJid(phone);
 
-    if (!phone || !message) {
+    if (!jid || message === undefined || message === null || String(message) === '') {
         return sendError(res, 400, 'MISSING_PARAMETER', 'phone and message are required');
     }
 
     try {
-        const sentMsg = await sendText(session, toJid(phone), message);
+        const sentMsg = await sendText(session, jid, String(message));
 
         console.log(`✅ Message sent to ${phone} with ID: ${sentMsg?.key?.id}`);
 
@@ -221,19 +300,28 @@ app.post('/sessions/:session/messages', async (req, res) => {
 });
 
 app.post('/sessions/:session/messages/media', async (req, res) => {
-    const { session } = req.params;
+    const session = parseSessionId(req, res);
+    if (!session) return;
     const { phone, file, caption, message, fileName, file_name } = req.body || {};
+    const jid = toJid(phone);
     const mediaCaption = caption || message || '';
     const mediaFileName = fileName || file_name;
 
-    if (!phone || !file) {
+    if (!jid || !file) {
         return sendError(res, 400, 'MISSING_PARAMETER', 'phone and file are required');
+    }
+
+    let fileUrl;
+    try {
+        fileUrl = assertSafeMediaUrl(file);
+    } catch (err) {
+        return sendError(res, 400, 'INVALID_PARAMETER', err.message);
     }
 
     try {
         let response;
         try {
-            response = await axios.get(file, {
+            response = await axios.get(fileUrl, {
                 responseType: 'arraybuffer',
                 timeout: 30000,
                 maxContentLength: 50 * 1024 * 1024
@@ -244,7 +332,7 @@ app.post('/sessions/:session/messages/media', async (req, res) => {
         }
 
         const buffer = Buffer.from(response.data);
-        const mimeType = response.headers['content-type'] || mime.lookup(file) || 'application/octet-stream';
+        const mimeType = String(response.headers['content-type'] || mime.lookup(fileUrl) || 'application/octet-stream').split(';')[0].trim();
 
         const mediaPayload = {
             mimetype: mimeType,
@@ -263,7 +351,7 @@ app.post('/sessions/:session/messages/media', async (req, res) => {
             mediaPayload.fileName = mediaFileName || `document_${Date.now()}.${mime.extension(mimeType) || 'bin'}`;
         }
 
-        const sentMsg = await sendMedia(session, toJid(phone), mediaPayload);
+        const sentMsg = await sendMedia(session, jid, mediaPayload);
 
         console.log(`✅ Media sent to ${phone} with ID: ${sentMsg?.key?.id}`);
 
@@ -281,15 +369,17 @@ app.post('/sessions/:session/messages/media', async (req, res) => {
 });
 
 app.post('/sessions/:session/messages/read', async (req, res) => {
-    const { session } = req.params;
+    const session = parseSessionId(req, res);
+    if (!session) return;
     const { messageId, phone } = req.body || {};
+    const jid = toJid(phone);
 
-    if (!messageId || !phone) {
+    if (!messageId || !jid) {
         return sendError(res, 400, 'MISSING_PARAMETER', 'messageId and phone are required');
     }
 
     try {
-        await markRead(session, [{ id: messageId, remoteJid: toJid(phone), fromMe: false }]);
+        await markRead(session, [{ id: String(messageId), remoteJid: jid, fromMe: false }]);
 
         return sendSuccess(res, 200, 'Message marked as read', {
             session,
@@ -324,7 +414,7 @@ async function startServer() {
             console.log(`✅ API server running at http://localhost:${PORT}`);
             console.log(`🔌 Sessions stay idle on disk until send or status probe`);
             console.log(`🔒 Incoming message handlers disabled`);
-            console.log(`🔄 Using Baileys version 6.7.18`);
+            console.log(`🔄 Using Baileys version ${BAILEYS_VERSION}`);
         });
     } catch (err) {
         console.error('❌ Failed to start server:', err);

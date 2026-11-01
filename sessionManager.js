@@ -31,7 +31,6 @@ const idleTimers = {};
 const qrTimers = {};
 const restartAttempts = {};
 const restartTimers = {};
-const intentionalClose = new Set();
 
 let cachedBaileysVersion = null;
 let cachedBaileysVersionAt = 0;
@@ -195,10 +194,10 @@ function closeSocket(sessionId, { deleteFiles = false } = {}) {
     clearQrTimer(sessionId);
     clearRestartTimer(sessionId);
     delete restartAttempts[sessionId];
-    intentionalClose.add(sessionId);
 
     const sock = sessions[sessionId];
     if (sock) {
+        sock.__closedByUs = true;
         try {
             sock.ev.removeAllListeners();
         } catch (e) {
@@ -239,8 +238,6 @@ function closeSocket(sessionId, { deleteFiles = false } = {}) {
         sessionStatus[sessionId] = isSessionValid(sessionId) ? 'idle' : (sessionStatus[sessionId] || 'idle');
         settleWaiters(sessionId, new Error('Session disconnected'));
     }
-
-    setTimeout(() => intentionalClose.delete(sessionId), 1000);
 }
 
 function scheduleIdleDisconnect(sessionId, delayMs) {
@@ -292,7 +289,6 @@ async function createSocket(sessionId) {
     const sock = makeWASocket({
         version,
         auth: state,
-        printQRInTerminal: false,
         logger,
         browser: Browsers.ubuntu('Chrome'),
         connectTimeoutMs: 60000,
@@ -313,6 +309,10 @@ async function createSocket(sessionId) {
 
     sock.ev.on('connection.update', async (update) => {
         try {
+            if (sock.__closedByUs || sessions[sessionId] !== sock) {
+                return;
+            }
+
             const { connection, lastDisconnect, qr } = update;
             lastActivity[sessionId] = Date.now();
 
@@ -375,10 +375,6 @@ async function createSocket(sessionId) {
                     statusCode === 515 ||
                     /restart required/i.test(errorMessage);
 
-                if (intentionalClose.has(sessionId)) {
-                    return;
-                }
-
                 if (loggedOut) {
                     lastError[sessionId] = 'logged_out';
                     console.log(`🚫 Session permanently logged out: ${sessionId}`);
@@ -402,13 +398,12 @@ async function createSocket(sessionId) {
                         restartTimers[sessionId] = setTimeout(() => {
                             delete restartTimers[sessionId];
                             withLock(sessionId, async () => {
-                                if (intentionalClose.has(sessionId)) return;
                                 if (sessions[sessionId]) return;
                                 await createSocket(sessionId);
                             }).catch((err) => {
                                 console.error(`Failed restart reconnect for ${sessionId}:`, err.message);
                                 lastError[sessionId] = err.message;
-                                sessionStatus[sessionId] = isSessionValid(sessionId) ? 'idle' : 'idle';
+                                sessionStatus[sessionId] = 'idle';
                                 settleWaiters(sessionId, err);
                             });
                         }, RESTART_RECONNECT_DELAY_MS);
@@ -422,7 +417,7 @@ async function createSocket(sessionId) {
                 delete sessions[sessionId];
                 clearIdleTimer(sessionId);
                 refCount[sessionId] = 0;
-                sessionStatus[sessionId] = isSessionValid(sessionId) ? 'idle' : 'idle';
+                sessionStatus[sessionId] = 'idle';
                 settleWaiters(sessionId, new Error(errorMessage || 'Session disconnected'));
             }
         } catch (updateError) {
@@ -465,7 +460,7 @@ async function startSession(sessionId) {
 }
 
 async function ensureConnected(sessionId, timeoutMs = CONNECT_TIMEOUT_MS) {
-    return withLock(sessionId, async () => {
+    await withLock(sessionId, async () => {
         if (sessions[sessionId] && sessionStatus[sessionId] === 'connected') {
             return sessions[sessionId];
         }
@@ -478,18 +473,18 @@ async function ensureConnected(sessionId, timeoutMs = CONNECT_TIMEOUT_MS) {
             }
             await createSocket(sessionId);
         }
-
-        try {
-            return await waitUntilConnected(sessionId, timeoutMs);
-        } catch (err) {
-            if (sessions[sessionId] && sessionStatus[sessionId] !== 'connected') {
-                closeSocket(sessionId);
-            }
-            const timeoutError = new Error(err.message || 'Connection timeout');
-            timeoutError.code = err.code || 'CONNECT_TIMEOUT';
-            throw timeoutError;
-        }
     });
+
+    try {
+        return await waitUntilConnected(sessionId, timeoutMs);
+    } catch (err) {
+        if (sessions[sessionId] && sessionStatus[sessionId] !== 'connected') {
+            closeSocket(sessionId);
+        }
+        const timeoutError = new Error(err.message || 'Connection timeout');
+        timeoutError.code = err.code || 'CONNECT_TIMEOUT';
+        throw timeoutError;
+    }
 }
 
 async function probeSession(sessionId) {
