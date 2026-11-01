@@ -1,15 +1,13 @@
+# WhatsApp session data (auth keys, device state)
+sessions/*
+!sessions/.gitkeep
+
+# Generated QR images
+qrs/*
+!qrs/.gitkeep
+
+# Dependencies
 node_modules/
-.env
-logs/
-WHATSAPP_V2/
-src/storage/sessions/*
-!src/storage/sessions/.gitkeep
-src/storage/qr/*
-!src/storage/qr/.gitkeep
+
+# OS / editor
 .DS_Store
-*.log
-coverage/
-.idea/
-.vscode/
-dist/
-.pm2/
